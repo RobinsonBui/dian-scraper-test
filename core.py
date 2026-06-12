@@ -197,7 +197,12 @@ def detect_block(response: APIResponse, body_preview: bytes) -> tuple[bool, str 
 
 
 def extract_pdf_xml_from_zip(zip_bytes: bytes) -> tuple[bytes | None, str | None, list[str]]:
-    """Extract PDF bytes + XML text from a DIAN ZIP. Returns (pdf, xml, filenames)."""
+    """Extract PDF bytes + XML text from a DIAN ZIP. Returns (pdf, xml, filenames).
+
+    Kept for ad-hoc tooling and the legacy UI (if it ever needs it).
+    The main scraping path no longer calls this — the ZIP is shipped
+    to the consumer as-is so extraction happens at the consumer side,
+    where it doesn't burn DIAN-facing time."""
     pdf_bytes: bytes | None = None
     xml_text: str | None = None
     filenames: list[str] = []
@@ -983,21 +988,21 @@ class DianTestScraper:
                     zip_path = self.downloads_dir / f"{safe_id}.zip"
                     zip_path.write_bytes(body)
 
-                    # Extract PDF + XML
-                    pdf_bytes, xml_text, filenames = extract_pdf_xml_from_zip(body)
+                    # We intentionally DO NOT extract PDF/XML to disk
+                    # here. The consumer (NUVARA) downloads only the
+                    # ZIP and extracts the PDF + XML in-memory on its
+                    # side. That cuts:
+                    #   - ~30% off the per-invoice latency in the
+                    #     scraper (no zip read + 2 disk writes)
+                    #   - 2/3 of the scraper→NUVARA transfer
+                    #   - 2/3 of the R2 upload volume
+                    #
+                    # _zip_has_real_pdf is still used above to decide
+                    # if we should retry through DownloadZipFiles. That
+                    # check reads the zip with BytesIO so it doesn't
+                    # touch disk.
                     pdf_filename = None
                     xml_filename = None
-                    # Guard: only write PDF if it has real content and starts
-                    # with the PDF magic number. Avoids writing 0-byte files
-                    # that break the viewer.
-                    if pdf_bytes and len(pdf_bytes) > 0 and pdf_bytes[:4] == b"%PDF":
-                        pdf_path = self.downloads_dir / f"{safe_id}.pdf"
-                        pdf_path.write_bytes(pdf_bytes)
-                        pdf_filename = pdf_path.name
-                    if xml_text is not None:
-                        xml_path = self.downloads_dir / f"{safe_id}.xml"
-                        xml_path.write_text(xml_text, encoding="utf-8")
-                        xml_filename = xml_path.name
 
                     return DownloadEvent(
                         timestamp=datetime.utcnow().isoformat(),
@@ -1009,7 +1014,7 @@ class DianTestScraper:
                         http_status=200,
                         elapsed_ms=elapsed_ms,
                         bytes_downloaded=len(body),
-                        notes=f"saved zip + extracted {len(filenames)} files{fallback_note}",
+                        notes=f"saved zip ({len(body)} bytes){fallback_note}",
                         pdf_filename=pdf_filename,
                         xml_filename=xml_filename,
                         issuer_nit=invoice.issuer_nit,
