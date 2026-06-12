@@ -1,5 +1,11 @@
 name: Build & push Docker image to GHCR
 
+# NOTE: Dokploy currently builds this image directly from git on every
+# push to main (see docker-compose.yml `build:` block). This workflow
+# is kept as a fallback for environments that can't build on-deploy
+# (e.g. ephemeral runners, registry-pull-only deploys). It still
+# produces the same image tags so we can re-enable it without changes.
+
 # When to build:
 #   - every push to main: tags `:main` (rolling latest, for previews)
 #   - every push of an annotated git tag (e.g. v1.61.0): tags the matching

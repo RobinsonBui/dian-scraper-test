@@ -1,12 +1,25 @@
-# docker-compose.yml — for Dokploy deploy
+# docker-compose.yml — for Dokploy "Compose" deploy from git
 #
-# Dokploy mode: "raw" compose. Pulls the prebuilt image from GHCR.
-# Code lives baked into the image; downloads/ and logs/ are persisted
-# as named volumes so we don't lose evidence between deploys.
+# Dokploy clones this repo on every deploy and builds the image
+# locally from the Dockerfile. No GHCR / no registry push step
+# required; every commit on `main` becomes a fresh build.
+#
+# Configure on Dokploy side:
+#   Provider:     GitHub
+#   Repository:   RobinsonBui/dian-scraper-test
+#   Branch:       main
+#   Build path:   .
+#   Compose file: docker-compose.yml
+#   Watch paths:  (leave empty — rebuild on every push)
+#
+# Volumes for downloads/ and logs/ are preserved across deploys so
+# we keep evidence between runs.
 
 services:
   dian-scraper:
-    image: ghcr.io/robinsonbui/dian-scraper-test:v1.61.0
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: dian-scraper-test
     restart: unless-stopped
     ports:
