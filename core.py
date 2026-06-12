@@ -1019,8 +1019,12 @@ class DianTestScraper:
                         xml_filename=xml_filename,
                         issuer_nit=invoice.issuer_nit,
                         issue_date=invoice.issue_date,
-                        pdf_b64_size=len(pdf_bytes) if pdf_bytes else None,
-                        xml_preview=(xml_text[:2000] if xml_text else None),
+                        # The scraper no longer extracts PDF/XML — the
+                        # consumer does it. These fields stay None so
+                        # the DownloadEvent shape is preserved without
+                        # paying the extract cost here.
+                        pdf_b64_size=None,
+                        xml_preview=None,
                     )
                 else:
                     return DownloadEvent(
