@@ -419,6 +419,26 @@ async def _run_job(job: JobRecord) -> None:
     job.status = "running"
     job.started_at = datetime.utcnow().isoformat()
 
+    def _push_phase_event(phase: str, status: str, notes: str | None = None) -> dict[str, Any]:
+        """Push a synthetic 'phase event' onto job.events.
+
+        Phase events are higher-level than per-CUFE DownloadEvents and
+        let the UI render a coarse timeline (started, listing, finished).
+        Shaped to deserialize the same way as DownloadEvent payloads on
+        the consumer side.
+        """
+        return {
+            "timestamp": datetime.utcnow().isoformat(),
+            "sequence": 0,
+            "cufe": "",
+            "prefijo_folio": "",
+            "phase": phase,
+            "status": status,
+            "notes": notes,
+        }
+
+    job.events.append(_push_phase_event("lifecycle", "started", "Job aceptado por el scraper, abriendo browser."))
+
     async def cb(event: DownloadEvent) -> None:
         payload = asdict(event)
         job.events.append(payload)
@@ -457,9 +477,15 @@ async def _run_job(job: JobRecord) -> None:
             await state.broadcast(
                 {"type": "summary", "payload": summary, "job_id": job.id}
             )
+            job.events.append(_push_phase_event(
+                "lifecycle",
+                "summary",
+                f"Engine summary: total={summary.get('total')} ok={summary.get('ok')} failed={summary.get('failed')}",
+            ))
     except Exception as e:
         job.status = "failed"
         job.error = f"{type(e).__name__}: {e}"
+        job.events.append(_push_phase_event("lifecycle", "failed", job.error))
         await state.broadcast(
             {
                 "type": "error",
@@ -471,6 +497,11 @@ async def _run_job(job: JobRecord) -> None:
         logger.close()
         state.is_running = False
         job.finished_at = datetime.utcnow().isoformat()
+        job.events.append(_push_phase_event(
+            "lifecycle",
+            "finished",
+            f"Estado final: {job.status}",
+        ))
         await state.broadcast(
             {
                 "type": "status",
@@ -520,6 +551,54 @@ async def get_job(job_id: str) -> dict[str, Any]:
     if job is None:
         raise HTTPException(404, "job not found")
     return job.to_dict()
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def get_job_events(
+    job_id: str,
+    since: int = 0,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Cursor-paged event log for a job.
+
+    Returns events with `event_index > since` so a polling consumer
+    (e.g. NUVARA's UI) can fetch only the new ones each round trip.
+
+    Each event also carries an `event_index` (1-based, monotonic per
+    job) and a `phase`/`status` pair the consumer can render directly.
+
+    The full `events` array on `to_dict()` stays as the source of
+    truth — this endpoint just exposes a slice of it.
+    """
+    job = state.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+
+    if limit <= 0 or limit > 1000:
+        limit = 200
+    if since < 0:
+        since = 0
+
+    sliced: list[dict[str, Any]] = []
+    # Walk the existing events list — we don't have an explicit
+    # event_index field yet, so the position in the list IS the index.
+    for idx, ev in enumerate(job.events, start=1):
+        if idx <= since:
+            continue
+        sliced.append({**ev, "event_index": idx})
+        if len(sliced) >= limit:
+            break
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "events": sliced,
+        # `next_since` is what the consumer should pass back on the
+        # next poll to keep walking forward.
+        "next_since": (sliced[-1]["event_index"] if sliced else since),
+        # `total` lets the consumer detect when it's caught up.
+        "total": len(job.events),
+    }
 
 
 @app.post("/api/start")
