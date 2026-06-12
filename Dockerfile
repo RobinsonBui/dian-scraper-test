@@ -26,11 +26,11 @@ RUN mkdir -p /app/downloads /app/logs
 
 EXPOSE 8765
 
-# Healthcheck — hits the index page; if FastAPI is up it'll return 200
+# Healthcheck — hits /healthz (public, no auth) so we don't need to bake
+# the API key into the image just to verify the process is alive.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,sys; \
-import urllib.error; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/', timeout=3).status == 200 else 1)" \
+sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=3).status == 200 else 1)" \
     || exit 1
 
 CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8765"]

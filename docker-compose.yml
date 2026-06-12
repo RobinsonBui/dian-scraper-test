@@ -6,7 +6,7 @@
 
 services:
   dian-scraper:
-    image: ghcr.io/robinsonbui/dian-scraper-test:v1.60.0-2
+    image: ghcr.io/robinsonbui/dian-scraper-test:v1.61.0
     container_name: dian-scraper-test
     restart: unless-stopped
     ports:
@@ -18,11 +18,24 @@ services:
       - dian-logs:/app/logs
     environment:
       - TZ=America/Bogota
+      # REQUIRED in any deploy that's reachable from outside localhost.
+      # See M2M.md for the auth model. Generate the secret once with:
+      #   python -c "import secrets; print(secrets.token_urlsafe(48))"
+      # and set the SAME value as DIAN_SCRAPER_ALT_API_KEY in nuvara apps/api.
+      - SCRAPER_API_KEY=${SCRAPER_API_KEY:-}
       # Optional: route browser+API traffic through a proxy with Colombian
       # exit node. Set this in Dokploy → Environment when the server lives
       # outside CO and DIAN responds slow.
       # Format: http://user:pass@host:port (URL-encode special chars in pass).
       - PROXY_URL=${PROXY_URL:-}
+    # Dokploy healthcheck consumes the unauthenticated /healthz so the
+    # platform can verify liveness without exposing the API key.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 volumes:
   dian-downloads:
