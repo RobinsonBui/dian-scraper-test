@@ -1,0 +1,29 @@
+# docker-compose.yml — for Dokploy deploy
+#
+# Dokploy mode: "raw" compose. Pulls the prebuilt image from GHCR.
+# Code lives baked into the image; downloads/ and logs/ are persisted
+# as named volumes so we don't lose evidence between deploys.
+
+services:
+  dian-scraper:
+    image: ghcr.io/robinsonbui/dian-scraper-test:v1.60.0-2
+    container_name: dian-scraper-test
+    restart: unless-stopped
+    ports:
+      # Host:Container — Dokploy/Traefik can also route via labels,
+      # but a direct port mapping makes ad-hoc testing easier.
+      - "8765:8765"
+    volumes:
+      - dian-downloads:/app/downloads
+      - dian-logs:/app/logs
+    environment:
+      - TZ=America/Bogota
+      # Optional: route browser+API traffic through a proxy with Colombian
+      # exit node. Set this in Dokploy → Environment when the server lives
+      # outside CO and DIAN responds slow.
+      # Format: http://user:pass@host:port (URL-encode special chars in pass).
+      - PROXY_URL=${PROXY_URL:-}
+
+volumes:
+  dian-downloads:
+  dian-logs:
