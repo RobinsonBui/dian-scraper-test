@@ -69,6 +69,38 @@ STATIC_DIR = BASE_DIR / "static"
 # the server runs unauthenticated (legacy single-operator local dev).
 SCRAPER_API_KEY: str = os.environ.get("SCRAPER_API_KEY", "").strip()
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int from env with a sane fallback.
+
+    Returns the default when the env var is unset, empty, or doesn't
+    parse cleanly. We don't want a typo in Dokploy → Environment to
+    crash the container on boot.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+# Per-invoice random sleep window. The scraper picks a uniform value in
+# [DEFAULT_DELAY_MIN_MS, DEFAULT_DELAY_MAX_MS] before each download to
+# look like a human. Tighter window = faster runs but higher block
+# risk; loosen these if Azure WAF starts 403'ing.
+#
+# Defaults: 1000..6000 ms — tuned empirically against the DIAN portal
+# in june 2026. Override per-deploy via Dokploy → Environment.
+DEFAULT_DELAY_MIN_MS: int = _env_int("DEFAULT_DELAY_MIN_MS", 1000)
+DEFAULT_DELAY_MAX_MS: int = _env_int("DEFAULT_DELAY_MAX_MS", 6000)
+# Every Nth download the scraper takes a longer pause (3..6× the
+# normal window) to look less robotic. Set high (e.g. 1000) to disable
+# de-facto.
+DEFAULT_LONG_PAUSE_EVERY: int = _env_int("DEFAULT_LONG_PAUSE_EVERY", 30)
+
 # Paths that the middleware lets through without checking the API key:
 # the UI HTML root, the static assets, FastAPI's own docs, and a
 # liveness/readiness endpoint for Dokploy healthchecks.
@@ -290,9 +322,12 @@ class StartRequest(BaseModel):
     end_date: str = Field(..., description="YYYY-MM-DD")
     max_invoices: int = 30
     headless: bool = True
-    delay_min_ms: int = 5000
-    delay_max_ms: int = 13000
-    long_pause_every: int = 30
+    # Delays default to the server-wide env tuning. M2M callers can
+    # still override them per-request (e.g. when reproducing a block
+    # locally) by sending explicit values in the POST body.
+    delay_min_ms: int = Field(default_factory=lambda: DEFAULT_DELAY_MIN_MS)
+    delay_max_ms: int = Field(default_factory=lambda: DEFAULT_DELAY_MAX_MS)
+    long_pause_every: int = Field(default_factory=lambda: DEFAULT_LONG_PAUSE_EVERY)
 
 
 # --------------------------------------------------------------------------
@@ -319,10 +354,19 @@ async def healthz() -> dict[str, Any]:
 
     Public on purpose so Dokploy / load balancer healthchecks don't need
     the API key.
+
+    Also surfaces the tuning defaults so an operator can verify from
+    outside that the env vars actually landed in the running container
+    (saves one round trip to `docker inspect`).
     """
     return {
         "status": "ok",
         "auth_required": bool(SCRAPER_API_KEY),
+        "defaults": {
+            "delay_min_ms": DEFAULT_DELAY_MIN_MS,
+            "delay_max_ms": DEFAULT_DELAY_MAX_MS,
+            "long_pause_every": DEFAULT_LONG_PAUSE_EVERY,
+        },
     }
 
 

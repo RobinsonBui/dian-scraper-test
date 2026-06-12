@@ -41,6 +41,13 @@ services:
       # outside CO and DIAN responds slow.
       # Format: http://user:pass@host:port (URL-encode special chars in pass).
       - PROXY_URL=${PROXY_URL:-}
+      # Per-invoice random sleep window. The scraper picks a uniform
+      # value in [DEFAULT_DELAY_MIN_MS, DEFAULT_DELAY_MAX_MS] before
+      # each download to look like a human. Tune in Dokploy → Env if
+      # Azure WAF starts 403'ing.
+      - DEFAULT_DELAY_MIN_MS=${DEFAULT_DELAY_MIN_MS:-1000}
+      - DEFAULT_DELAY_MAX_MS=${DEFAULT_DELAY_MAX_MS:-6000}
+      - DEFAULT_LONG_PAUSE_EVERY=${DEFAULT_LONG_PAUSE_EVERY:-30}
     # Dokploy healthcheck consumes the unauthenticated /healthz so the
     # platform can verify liveness without exposing the API key.
     healthcheck:

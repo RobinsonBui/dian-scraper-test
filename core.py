@@ -366,9 +366,24 @@ class DianTestScraper:
                 ),
             )
         )
-        await self.page.goto(
-            RECEIVED_URL, wait_until="domcontentloaded", timeout=120000
-        )
+        # Wait for `networkidle` (no more than 2 in-flight requests for
+        # 500ms) instead of just `domcontentloaded`. The listing page
+        # pulls jQuery + DataTables + the calendar widget AFTER initial
+        # HTML, and we hit the timing window where those scripts
+        # weren't done loading when we started querying for them.
+        # Falls back to domcontentloaded if networkidle never settles
+        # (e.g. portal has a long-polling XHR open).
+        try:
+            await self.page.goto(
+                RECEIVED_URL, wait_until="networkidle", timeout=60000
+            )
+        except Exception:
+            # networkidle can hang on long-polling endpoints; fall back
+            # to the previous behaviour and let waitForDT below absorb
+            # the remaining script load time.
+            await self.page.goto(
+                RECEIVED_URL, wait_until="domcontentloaded", timeout=120000
+            )
         await asyncio.sleep(2)
 
         start_dian = to_dian_date(self.start_date, end=False)
