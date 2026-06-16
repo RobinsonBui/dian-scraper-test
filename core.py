@@ -934,32 +934,76 @@ class DianTestScraper:
                 )
             )
 
-        # Try submit — search button or fallback to form submission.
+        # Submit. CRITICAL: DIAN's portal requires a real click on the
+        # "Buscar" button — a naive form.submit() bypasses the jQuery
+        # handler that writes the date range hidden inputs and fires
+        # the AJAX call to /Document/GetDocumentsPageToken. Without
+        # that handler running, DIAN ignores the date range we just
+        # set and returns its default window (last N invoices),
+        # producing the exact symptom of "asked for April, got June".
+        #
+        # We try several click strategies in order of how reliably
+        # they dispatch the real DIAN handler:
+        #
+        #   1. .btn-radian-success — the actual class on DIAN's
+        #      green Buscar button in the current layout (2026-06).
+        #   2. button:has-text('Buscar') — text-based fallback that
+        #      survives a class rename.
+        #   3. .btn-search and #searchBtn — DIAN's legacy selectors
+        #      that the click handler is still registered against,
+        #      kept for older portal versions and as a safety net.
+        #
+        # We deliberately do NOT fall back to form.submit() any more.
+        # If every click target failed it means DIAN's UI changed
+        # again and we'd rather fail loudly here than silently send
+        # the wrong range.
         submitted = False
         for sel in (
-            "button[type='submit']",
-            "#searchBtn",
-            ".btn-search",
+            ".btn-radian-success",
             "button:has-text('Buscar')",
+            ".btn-search",
+            "#searchBtn",
             "button:has-text('Consultar')",
         ):
             try:
                 await self.page.click(sel, timeout=2000)
                 submitted = True
+                await self._emit(
+                    DownloadEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        sequence=0,
+                        cufe="",
+                        prefijo_folio="",
+                        phase="log",
+                        status="info",
+                        notes=f"Clicked search button: {sel}",
+                    )
+                )
                 break
             except Exception:
                 continue
         if not submitted:
-            # Fallback: trigger the form submit via JS
-            try:
-                await self.page.evaluate(
-                    """() => {
-                        const form = document.querySelector('form');
-                        if (form) form.submit();
-                    }"""
+            # Loud failure with a snapshot so we can see WHAT DIAN
+            # is serving when no known button is present. The list
+            # phase will report empty results downstream, which is
+            # the right outcome for a UI we can't drive.
+            await self._emit(
+                DownloadEvent(
+                    timestamp=datetime.utcnow().isoformat(),
+                    sequence=0,
+                    cufe="",
+                    prefijo_folio="",
+                    phase="list",
+                    status="fail",
+                    error="no-search-button",
+                    notes=(
+                        "Could not find DIAN's 'Buscar' button. The "
+                        "portal layout may have changed; check the "
+                        "next listing-failed snapshot for the new "
+                        "markup."
+                    ),
                 )
-            except Exception:
-                pass
+            )
 
         try:
             await self.page.wait_for_load_state("networkidle", timeout=15000)
