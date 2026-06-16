@@ -387,6 +387,15 @@ class StartRequest(BaseModel):
     delay_min_ms: int = Field(default_factory=lambda: DEFAULT_DELAY_MIN_MS)
     delay_max_ms: int = Field(default_factory=lambda: DEFAULT_DELAY_MAX_MS)
     long_pause_every: int = Field(default_factory=lambda: DEFAULT_LONG_PAUSE_EVERY)
+    # CUFEs already known to the consumer (typically NUVARA) for this
+    # company in the requested date range. The engine filters them out
+    # right after the DOM listing so we never re-download invoices the
+    # consumer already has. NUVARA scopes the list by issueDate to keep
+    # the payload small (~50 KB for a 6-month range on an active tenant).
+    # Empty/None disables the filter — the legacy "download everything"
+    # behaviour an operator gets when driving the scraper from the
+    # standalone UI without a NUVARA-side lookup.
+    skip_cufes: Optional[list[str]] = None
 
 
 # --------------------------------------------------------------------------
@@ -857,6 +866,10 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
                 delay_min_ms=req.delay_min_ms,
                 delay_max_ms=req.delay_max_ms,
                 long_pause_every=req.long_pause_every,
+                # The consumer's known-CUFE list lands here. core
+                # filters them out at listing time so the per-CUFE
+                # download loop never sees them.
+                skip_cufes=req.skip_cufes,
                 cancel_event=cancel_event,
             ) as scraper:
                 summary = await scraper.run()

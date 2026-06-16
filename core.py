@@ -314,6 +314,7 @@ class DianTestScraper:
         delay_max_ms: int = HUMAN_DELAY_MAX_MS,
         long_pause_every: int = LONG_PAUSE_EVERY_N,
         cancel_event: asyncio.Event | None = None,
+        skip_cufes: list[str] | set[str] | None = None,
     ) -> None:
         # Two new params (both opt-in, defaults preserve legacy behaviour):
         #
@@ -343,6 +344,16 @@ class DianTestScraper:
         self.delay_max_ms = delay_max_ms
         self.long_pause_every = long_pause_every
         self.cancel_event = cancel_event or asyncio.Event()
+        # Consumer-provided CUFE skip list. Stored as a set for O(1)
+        # `in` checks during the per-row filter in list_invoices().
+        # We deliberately drop None/empty strings up front so a sloppy
+        # caller can't silently fill the set with junk that never
+        # matches anything.
+        self.skip_cufes: set[str] = (
+            {c for c in skip_cufes if c}
+            if skip_cufes
+            else set()
+        )
 
         self.pw: Playwright | None = None
         self.browser: Browser | None = None
@@ -1135,10 +1146,11 @@ class DianTestScraper:
             except Exception:
                 pass
 
-        invoices: list[InvoiceRow] = []
+        # Build candidates from DOM rows (no max_invoices cap yet — we
+        # apply that AFTER skip_cufes so the cap protects against the
+        # new-invoice budget, not the gross listing size).
+        candidates: list[InvoiceRow] = []
         for i, row in enumerate(rows_data):
-            if i >= self.max_invoices:
-                break
             cells = row.get("cells", [])
             data_id = row.get("dataId", "")
             invoice = InvoiceRow(
@@ -1150,7 +1162,42 @@ class DianTestScraper:
                 raw=row,
             )
             if invoice.cufe:
-                invoices.append(invoice)
+                candidates.append(invoice)
+
+        # Skip CUFEs the consumer (NUVARA) already has. We log the
+        # skipped count separately so an operator can see at a glance
+        # that the engine isn't re-downloading already-imported
+        # invoices. Skip BEFORE the max_invoices cap: re-downloading a
+        # known invoice and counting it toward the cap would defeat
+        # the purpose of telling us to skip it.
+        skipped_count = 0
+        if self.skip_cufes:
+            filtered: list[InvoiceRow] = []
+            for inv in candidates:
+                if inv.cufe in self.skip_cufes:
+                    skipped_count += 1
+                    continue
+                filtered.append(inv)
+            candidates = filtered
+            if skipped_count > 0:
+                await self._emit(
+                    DownloadEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        sequence=0,
+                        cufe="",
+                        prefijo_folio="",
+                        phase="list",
+                        status="info",
+                        notes=(
+                            f"Skipped {skipped_count} CUFEs already known "
+                            f"to the consumer; {len(candidates)} new to "
+                            f"download (skip_cufes size={len(self.skip_cufes)})"
+                        ),
+                    )
+                )
+
+        # Apply max_invoices cap on the post-skip set.
+        invoices = candidates[: self.max_invoices] if self.max_invoices > 0 else candidates
 
         await self._emit(
             DownloadEvent(
@@ -1163,7 +1210,8 @@ class DianTestScraper:
                 notes=(
                     f"found {len(invoices)} invoices "
                     f"(recordsTotal={records_total}, method={method}, "
-                    f"pages={pages}, max_cap={self.max_invoices})"
+                    f"pages={pages}, max_cap={self.max_invoices}, "
+                    f"skipped={skipped_count})"
                 ),
             )
         )
