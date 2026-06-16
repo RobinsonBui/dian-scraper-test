@@ -1307,16 +1307,47 @@ class DianTestScraper:
         # Build candidates from DOM rows (no max_invoices cap yet — we
         # apply that AFTER skip_cufes so the cap protects against the
         # new-invoice budget, not the gross listing size).
+        # DIAN's /Document/Received listing columns (as of 2026-06):
+        #   [0]  download button cell (no text)
+        #   [1]  Recepción           (delivery date)
+        #   [2]  Fecha                (issue date)
+        #   [3]  Prefijo
+        #   [4]  N° documento
+        #   [5]  Tipo                 (already exposed via dataType attr)
+        #   [6]  NIT Emisor
+        #   [7]  Emisor               (name)
+        #   [8]  NIT Receptor
+        #   [9]  Receptor
+        #   [10] Resultado
+        #   [11] Estado RADIAN
+        #   [12] Valor Total
+        #
+        # The previous mapping (folio=cells[1], nit=cells[2], date=cells[3])
+        # was inherited from an older DIAN UI and is silently broken on
+        # the current portal: it ends up storing the delivery date as the
+        # folio, the issue date as the NIT, and the prefijo as the issue
+        # date. Symptom in the UI was every invoice showing '—' on the
+        # Fecha column while the prefijo_folio cell looked like a date.
         candidates: list[InvoiceRow] = []
         for i, row in enumerate(rows_data):
             cells = row.get("cells", [])
             data_id = row.get("dataId", "")
+            # Compose 'Prefijo + N° documento' for prefijo_folio so the
+            # operator sees the same string DIAN renders (e.g. 'NE353',
+            # 'FE-12345'). Falls back to either piece alone if one is
+            # missing.
+            prefix = cells[3] if len(cells) > 3 else ""
+            number = cells[4] if len(cells) > 4 else ""
+            if prefix and number:
+                prefijo_folio = f"{prefix}{number}" if number.startswith(prefix) else f"{prefix}{number}"
+            else:
+                prefijo_folio = number or prefix or f"row-{i}"
             invoice = InvoiceRow(
                 cufe=data_id or (cells[0] if cells else ""),
                 track_id=data_id,
-                prefijo_folio=cells[1] if len(cells) > 1 else f"row-{i}",
-                issuer_nit=cells[2] if len(cells) > 2 else "",
-                issue_date=cells[3] if len(cells) > 3 else "",
+                prefijo_folio=prefijo_folio,
+                issuer_nit=cells[6] if len(cells) > 6 else "",
+                issue_date=cells[2] if len(cells) > 2 else "",
                 raw=row,
             )
             if invoice.cufe:
