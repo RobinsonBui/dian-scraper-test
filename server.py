@@ -299,6 +299,16 @@ def require_backend() -> JobBackend:
     return backend
 
 
+def _is_r2_mode() -> bool:
+    """True when the active backend ships files to R2 instead of disk.
+
+    Useful for the legacy /files/* endpoints, which need to tell a
+    misconfigured caller 'go read R2 directly' instead of pretending
+    the file doesn't exist (404) when really it just lives elsewhere.
+    """
+    return isinstance(backend, PostgresR2JobBackend)
+
+
 def _parse_iso_date(value: str) -> date:
     """Parse a YYYY-MM-DD string into a date.
 
@@ -449,15 +459,30 @@ async def healthz() -> dict[str, Any]:
 
     Also surfaces the tuning defaults so an operator can verify from
     outside that the env vars actually landed in the running container
-    (saves one round trip to `docker inspect`).
+    (saves one round trip to `docker inspect`). The `backend` field
+    tells you at a glance which storage path the process picked up —
+    crucial when triaging "why didn't this job land in R2".
     """
+    backend_name: str
+    if backend is None:
+        backend_name = "starting"
+    elif isinstance(backend, PostgresR2JobBackend):
+        backend_name = "postgres+r2"
+    else:
+        backend_name = "memory+local"
     return {
         "status": "ok",
         "auth_required": bool(SCRAPER_API_KEY),
+        "backend": backend_name,
+        "worker_id": WORKER_ID,
         "defaults": {
             "delay_min_ms": DEFAULT_DELAY_MIN_MS,
             "delay_max_ms": DEFAULT_DELAY_MAX_MS,
             "long_pause_every": DEFAULT_LONG_PAUSE_EVERY,
+            "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+            "worker_heartbeat_seconds": WORKER_HEARTBEAT_SECONDS,
+            "reaper_interval_seconds": REAPER_INTERVAL_SECONDS,
+            "reaper_max_idle_seconds": REAPER_MAX_IDLE_SECONDS,
         },
     }
 
@@ -489,27 +514,62 @@ def _media_type_for(name: str) -> str:
     return "application/octet-stream"
 
 
+def _gone_in_r2_mode(job_id: str | None, name: str) -> JSONResponse:
+    """Build the 410 Gone payload for /files endpoints in R2 mode.
+
+    Why 410 and not 404:
+      - 410 ('Gone') means 'this resource USED to exist here, look
+        somewhere else'. That's exactly what's happening — the bytes
+        moved to R2.
+      - 404 is ambiguous (typo? misconfigured client? job not found?)
+        and tempts a poller into spinning forever 'waiting for the
+        file to appear'.
+
+    Body carries enough info for the operator (and the test suite)
+    to find the file without guessing: the bucket layout key, and
+    the r2_url when we can resolve the job_files row. NUVARA already
+    reads r2_url from /api/jobs/{id} so it never hits this endpoint;
+    this 410 is purely a guard-rail for misconfigured clients.
+    """
+    detail: dict[str, Any] = {
+        "error": "gone",
+        "message": (
+            "Files are stored in R2 in this deployment. "
+            "Read `r2_url` from GET /api/jobs/{job_id} and fetch "
+            "from there instead."
+        ),
+    }
+    if job_id is not None:
+        detail["job_id"] = job_id
+        detail["expected_r2_prefix"] = f"dian-scraper-alt/.../{job_id}/"
+    detail["filename"] = name
+    return JSONResponse(status_code=status.HTTP_410_GONE, content=detail)
+
+
 @app.get("/files/{name}")
-async def serve_file_legacy(name: str) -> FileResponse:
-    """Legacy file endpoint kept for the human UI.
+async def serve_file_legacy(name: str) -> Any:
+    """Legacy flat file endpoint kept for the human UI.
 
-    The UI used to assume a flat downloads/ directory and a single live
-    run. We keep this working by resolving against the most recent job's
-    downloads subdir when it exists, falling back to the flat layout for
-    historical compatibility.
+    Resolution order, in local-filesystem mode:
+      1. Most recent job's per-job subdir (matches what the engine
+         writes today).
+      2. The legacy flat layout (kept so old links keep working).
 
-    M2M consumers should use `/files/{job_id}/{name}` instead — it's
-    explicit and isolates jobs.
-
-    Note: in postgres+R2 mode no files live on disk so this endpoint
-    returns 404 by design — NUVARA reads `r2_url` from /api/jobs/{id}.
-    Commit 2 will turn that 404 into a structured 410 Gone with the
-    R2 URL in the body so misconfigured callers see a clear signal.
+    In R2 mode we don't have either layout — return 410 Gone with a
+    pointer to where the file actually lives.
     """
     if "/" in name or ".." in name:
         raise HTTPException(400, "invalid filename")
 
     be = require_backend()
+
+    if _is_r2_mode():
+        recent = await be.list_recent_jobs(limit=1)
+        return _gone_in_r2_mode(
+            job_id=recent[0].id if recent else None,
+            name=name,
+        )
+
     candidates: list[Path] = []
     recent = await be.list_recent_jobs(limit=1)
     if recent:
@@ -518,25 +578,47 @@ async def serve_file_legacy(name: str) -> FileResponse:
 
     for path in candidates:
         if path.exists() and path.is_file():
-            return FileResponse(path, media_type=_media_type_for(name), filename=name)
+            return FileResponse(
+                path, media_type=_media_type_for(name), filename=name,
+            )
 
     raise HTTPException(404, "file not found")
 
 
 @app.get("/files/{job_id}/{name}")
-async def serve_file_for_job(job_id: str, name: str) -> FileResponse:
+async def serve_file_for_job(job_id: str, name: str) -> Any:
     """Explicit M2M file endpoint: scoped to a specific job's downloads.
 
     Filesystem-backed only — in postgres+R2 mode the bytes live in R2
-    and NUVARA fetches them from the `r2_url` exposed on /api/jobs/{id}.
-    Commit 2 turns the 404 here into a 410 Gone with the R2 URL in the
-    body so a misconfigured caller knows exactly where to look.
+    and the response is a 410 Gone whose body carries the r2_url for
+    the matching job_files row (when we can find it) so a
+    misconfigured caller has a clear next step.
     """
     if "/" in name or ".." in name or "/" in job_id or ".." in job_id:
         raise HTTPException(400, "invalid path")
     be = require_backend()
     if await be.get_job(job_id=job_id) is None:
         raise HTTPException(404, "job not found")
+
+    if _is_r2_mode():
+        files = await be.list_files(job_id=job_id)
+        match = next((f for f in files if f.name == name), None)
+        detail: dict[str, Any] = {
+            "error": "gone",
+            "message": (
+                "Files are stored in R2 in this deployment. "
+                "Use the r2_url below (or read it from "
+                "GET /api/jobs/{job_id}.files[]) to fetch the bytes."
+            ),
+            "job_id": job_id,
+            "filename": name,
+        }
+        if match is not None:
+            detail["r2_key"] = match.r2_key
+            detail["r2_url"] = match.r2_url
+            detail["size_bytes"] = match.size_bytes
+        return JSONResponse(status_code=status.HTTP_410_GONE, content=detail)
+
     file_path = DOWNLOADS_DIR / job_id / name
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(404, "file not found")
@@ -776,13 +858,15 @@ async def _emit_event(
     """Single point of truth for appending an event.
 
     Writes to the backend (durable log) and broadcasts to WebSocket
-    listeners (live UI). The WS push uses a shape compatible with the
-    legacy `state.broadcast` payload so static/index.html doesn't have
-    to change in this commit — the dedicated WS rework comes in commit 2.
+    listeners (live UI). The WS push shape carries the new `job_id`
+    at the top level so per-job WS filters work, plus the legacy
+    field aliases (timestamp, notes, cufe, prefijo_folio, sequence)
+    that the existing static/index.html consumes — until that UI is
+    rewritten, both consumers coexist with zero cost (every key is
+    a single dict lookup).
 
-    Errors are caught individually so a WS hiccup never aborts a write,
-    and a backend write failure never silently fails: we re-raise so
-    the caller (typically the scraper loop) decides what to do.
+    Backend write failures propagate. WS failures evict the failing
+    client without breaking the write.
     """
     assert backend is not None
     event_row = await backend.append_event(
@@ -804,7 +888,8 @@ async def _emit_event(
             "message": message,
             "payload": payload,
             "occurred_at": event_row.occurred_at.isoformat(),
-            # Legacy fields some UI code still reads. Cheap to include.
+            # Legacy fields the existing static/index.html still reads.
+            # Cheap to include; removed once the UI rewrite lands.
             "timestamp": event_row.occurred_at.isoformat(),
             "notes": message,
             "cufe": (payload or {}).get("cufe", ""),
@@ -812,12 +897,7 @@ async def _emit_event(
             "sequence": (payload or {}).get("sequence", 0),
         },
     }
-    ws_recent_events.append(ws_message)
-    for ws in list(ws_clients):
-        try:
-            await ws.send_json(ws_message)
-        except Exception:
-            ws_clients.discard(ws)
+    await _broadcast_ws(ws_message)
 
 
 async def _enqueue_job(req: StartRequest) -> JobRow:
@@ -1057,18 +1137,51 @@ async def get_status() -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _ws_filter_matches(ws: WebSocket, message: dict[str, Any]) -> bool:
+    """True if this WebSocket should receive this event.
+
+    A client connecting with `?job_id=<id>` opts into a single job's
+    stream — useful for the human UI when running multiple jobs in
+    parallel. Without the query param the client gets every event
+    (the legacy behaviour the existing UI assumes).
+    """
+    wanted = ws.query_params.get("job_id")
+    if not wanted:
+        return True
+    return message.get("job_id") == wanted
+
+
+async def _broadcast_ws(message: dict[str, Any]) -> None:
+    """Push `message` to every WebSocket client that wants it.
+
+    Snapshotting `ws_clients` before iterating because we mutate it
+    on send failures. A slow client doesn't block other recipients —
+    each send is awaited but the WS lib buffers internally; if a
+    client truly stalls past its TCP window we'll catch the
+    exception and evict it.
+    """
+    ws_recent_events.append(message)
+    for ws in list(ws_clients):
+        if not _ws_filter_matches(ws, message):
+            continue
+        try:
+            await ws.send_json(message)
+        except Exception:
+            ws_clients.discard(ws)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket) -> None:
-    """Live event broadcast for all in-flight jobs.
+    """Live event broadcast for in-flight jobs.
 
-    Every event written by `_emit_event` is pushed to every connected
-    client. Reconnecting clients see the most recent
-    `ws_recent_events.maxlen` events so a refreshing browser tab
+    Optional query param `?job_id=<id>` filters the stream to one
+    job. Without it the client receives every event from every job —
+    useful for the global operator dashboard, less useful when you
+    have ten jobs running in parallel and only care about one.
+
+    Reconnecting clients see the most recent ws_recent_events
+    (respecting the same filter) so a refreshing browser tab
     doesn't go blank for a few seconds.
-
-    Commit 2 will add a per-job filter so an operator focused on one
-    job doesn't see every other job's chatter; right now the UI shows
-    the combined stream.
     """
     if not _assert_ws_authorized(websocket):
         # 1008 = policy violation. Close before accept so the client gets
@@ -1079,10 +1192,11 @@ async def ws_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     ws_clients.add(websocket)
     try:
-        # Replay recent events so the UI shows history immediately
-        # without waiting for the next push.
+        # Replay recent events the client cares about. Same filter
+        # the live stream uses, applied to the ring buffer.
         for ev in list(ws_recent_events):
-            await websocket.send_json(ev)
+            if _ws_filter_matches(websocket, ev):
+                await websocket.send_json(ev)
         while True:
             # Keep connection alive — we don't expect client messages
             await websocket.receive_text()

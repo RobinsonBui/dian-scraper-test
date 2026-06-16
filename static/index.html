@@ -483,6 +483,11 @@
       selected: null,
       stats: { total: 0, ok: 0, fail: 0, block: 0, latencies: [] },
       currentTab: 'pdf',
+      // job_id of the run we kicked off most recently. Needed by
+      // POST /api/cancel which now requires {"job_id": "..."} because
+      // the server supports concurrent jobs and there is no longer
+      // a single "current" run to target globally.
+      currentJobId: null,
     };
 
     function updateStats() {
@@ -698,6 +703,11 @@
           alert('Error: ' + (err.detail || resp.statusText));
           return;
         }
+        // Capture the job_id the server assigned so the cancel
+        // button can target this specific run. With concurrent jobs
+        // the server no longer cancels "the current run" globally.
+        const body = await resp.json();
+        state.currentJobId = body.job_id || null;
         setRunning(true);
       } catch (e) {
         alert('Error: ' + e.message);
@@ -705,7 +715,15 @@
     });
 
     $('btnCancel').addEventListener('click', async () => {
-      await fetch('/api/cancel', { method: 'POST' });
+      if (!state.currentJobId) {
+        alert('Iniciá un run primero — no hay nada para cancelar.');
+        return;
+      }
+      await fetch('/api/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: state.currentJobId }),
+      });
     });
 
     $('btnClear').addEventListener('click', () => {
