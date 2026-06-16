@@ -878,13 +878,34 @@ class DianTestScraper:
             )
         await asyncio.sleep(2)
 
-        start_dian = to_dian_date(self.start_date, end=False)
-        end_dian = to_dian_date(self.end_date, end=True)
-
-        # DIAN uses HIDDEN inputs for the date range (#startDate, #endDate).
-        # Playwright's .fill() refuses to act on hidden elements, so we set
-        # the value via JS — same as what the portal's calendar widget does
-        # when the user picks a date.
+        # DIAN's portal uses jQuery daterangepicker on
+        # `#dashboard-report-range`. Its callback is the ONLY thing
+        # that writes the hidden inputs in the format DIAN's backend
+        # accepts (`YYYY/MM/DD`). Setting the hidden inputs directly
+        # to `DD/MM/YYYY` (what to_dian_date returns) makes the form
+        # POST land at /Document/Received with garbage in StartDate/
+        # EndDate — the controller then falls back to its default
+        # "last N invoices" window and returns May+June rows even
+        # when we asked for April.
+        #
+        # Strategy:
+        #   1. Set the hidden inputs to YYYY/MM/DD directly. That is
+        #      what daterangepicker's callback writes, what DIAN's
+        #      Buscar handler reads, and what the new
+        #      /Document/GetDocumentsPageToken AJAX puts in its body.
+        #   2. Drive the daterangepicker itself via its public API
+        #      (`setStartDate` / `setEndDate`) so the visible widget
+        #      and any internal state stay in sync with the hidden
+        #      values. This is the same code path a real click would
+        #      trigger.
+        #   3. Fall back to plain hidden-input writes if (2) fails
+        #      (e.g. the portal stripped daterangepicker on this page
+        #      version) — still better than the old DD/MM/YYYY shape.
+        from datetime import datetime as _dt
+        _start = _dt.fromisoformat(self.start_date)
+        _end = _dt.fromisoformat(self.end_date)
+        start_dian = _start.strftime("%Y/%m/%d")
+        end_dian = _end.strftime("%Y/%m/%d")
         try:
             applied = await self.page.evaluate(
                 """({startVal, endVal}) => {
@@ -899,11 +920,31 @@ class DianTestScraper:
                         el.dispatchEvent(new Event('change', { bubbles: true }));
                         return true;
                     };
+                    // 1. Hidden inputs — the canonical YYYY/MM/DD form.
                     const okStart = setVal('#startDate', startVal)
                         || setVal('[name="StartDate"]', startVal);
                     const okEnd = setVal('#endDate', endVal)
                         || setVal('[name="EndDate"]', endVal);
-                    return { okStart, okEnd };
+
+                    // 2. Drive the daterangepicker widget so its
+                    //    internal state matches the hidden inputs.
+                    //    Wrapped in try/catch because the widget may
+                    //    not be initialised yet on slow pages.
+                    let widgetOk = false;
+                    try {
+                        const jq = window.jQuery || window.$;
+                        if (jq) {
+                            const dp = jq('#dashboard-report-range')
+                                .data('daterangepicker');
+                            if (dp && typeof dp.setStartDate === 'function') {
+                                dp.setStartDate(startVal);
+                                dp.setEndDate(endVal);
+                                widgetOk = true;
+                            }
+                        }
+                    } catch (e) { /* keep widgetOk=false */ }
+
+                    return { okStart, okEnd, widgetOk };
                 }""",
                 {"startVal": start_dian, "endVal": end_dian},
             )
@@ -916,8 +957,11 @@ class DianTestScraper:
                     phase="log",
                     status="info",
                     notes=(
-                        f"date inputs set via JS: start={start_dian} ({applied.get('okStart')})"
-                        f" end={end_dian} ({applied.get('okEnd')})"
+                        f"date inputs set: start={start_dian} "
+                        f"end={end_dian} "
+                        f"(hiddenStart={applied.get('okStart')}, "
+                        f"hiddenEnd={applied.get('okEnd')}, "
+                        f"widget={applied.get('widgetOk')})"
                     ),
                 )
             )
