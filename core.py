@@ -1123,6 +1123,7 @@ class DianTestScraper:
                     const selectors = [
                         '.dt-paging button.next:not(.disabled):not([aria-disabled="true"])',
                         'a.paginate_button.next:not(.disabled)',
+                        '.dt-paging li.paginate_button.next:not(.disabled) a',
                         '.dt-paging button[aria-label="Next"]:not(.disabled):not([aria-disabled="true"])',
                         'button.dt-paging-button[data-dt-idx="next"]:not(.disabled):not([aria-disabled="true"])',
                     ];
@@ -1131,6 +1132,85 @@ class DianTestScraper:
                         if (btn) return btn;
                     }
                     return null;
+                };
+
+                /**
+                 * Reads the DataTables "Mostrando registros del X al Y de
+                 * Z" line and returns Z (recordsTotal). Returns null when
+                 * the info line isn't present yet. This is the only
+                 * RELIABLE way to know how many records DIAN's
+                 * server-side endpoint says exist for the active filter
+                 * — `allRows.length` only tells us what we've already
+                 * pulled into memory.
+                 *
+                 * DataTables localises the line so we match by digits.
+                 */
+                const readDtRecordsTotal = () => {
+                    const info = document.querySelector(
+                        '.dataTables_info, .dt-info, #tableDocuments_info'
+                    );
+                    if (!info) return null;
+                    const txt = (info.innerText || info.textContent || '').trim();
+                    // Matches 'del 1 al 10 de 97 registros' /
+                    // 'Showing 1 to 10 of 97 entries' / etc. We grab
+                    // the LAST integer in the line as the total.
+                    const matches = txt.match(/\d+/g);
+                    if (!matches || matches.length === 0) return null;
+                    const last = parseInt(matches[matches.length - 1], 10);
+                    return Number.isFinite(last) ? last : null;
+                };
+
+                /**
+                 * Try to switch the DataTable's page length to the
+                 * largest available option (100 if present, else the max
+                 * the dropdown offers). This collapses what would be 10
+                 * "Next" clicks into 1 for tenants with heavy invoice
+                 * volume. Falls back silently if the dropdown isn't
+                 * there — old DIAN deployments without the selector are
+                 * paginated 10-by-10 the slow way.
+                 */
+                const trySetPageLengthMax = async () => {
+                    const sel = document.querySelector(
+                        'select[name="tableDocuments_length"], '
+                        + 'select.dataTables_length, '
+                        + '.dataTables_length select, '
+                        + '.dt-length select'
+                    );
+                    if (!sel) return false;
+                    // Pick the highest option value <= 100. We cap at 100
+                    // because DIAN's server-side endpoint may throttle
+                    // or hard-cap larger pages with WAF rules; 100 is
+                    // the standard DataTables ceiling.
+                    let best = -1;
+                    for (const opt of sel.options) {
+                        const v = parseInt(opt.value, 10);
+                        if (!Number.isFinite(v) || v <= 0) continue;
+                        if (v > 100) continue;
+                        if (v > best) best = v;
+                    }
+                    if (best <= 0) return false;
+                    const currentRows = readCurrentPageRows();
+                    const prevSig = currentRows.length > 0
+                        ? `${currentRows[0].dataId}|${currentRows.length}`
+                        : `EMPTY:0`;
+                    sel.value = String(best);
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    // Wait for the table to redraw with the new page
+                    // size. We use the same change-detection signature
+                    // we use for Next clicks.
+                    const reloadDeadline = Math.min(
+                        Date.now() + 8000,
+                        deadline
+                    );
+                    while (Date.now() < reloadDeadline) {
+                        const rows = readCurrentPageRows();
+                        const sig = rows.length === 0
+                            ? `EMPTY:0`
+                            : `${rows[0].dataId}|${rows.length}`;
+                        if (sig !== prevSig && rows.length > 0) return true;
+                        await sleep(intervalMs);
+                    }
+                    return false;
                 };
 
                 const waitForFirstRows = async () => {
@@ -1188,19 +1268,69 @@ class DianTestScraper:
                             ok: true,
                             method: 'dom-zero-records',
                             recordsTotal: 0,
+                            dtRecordsTotal: readDtRecordsTotal(),
                             rows: [],
                             pages: 0,
+                            pageLengthChanged: false,
                         }));
                         return;
                     }
 
+                    // Bump the page length to the highest available
+                    // option (typically 100) BEFORE walking pagination.
+                    // For a tenant with 97 invoices on a single month,
+                    // this collapses ~10 Next clicks into 1 — each click
+                    // is a server-side draw against DIAN's listing
+                    // endpoint, which is rate-limited and triggers WAF
+                    // challenges when clicked too quickly.
+                    const pageLengthChanged = await trySetPageLengthMax();
+                    if (pageLengthChanged) {
+                        // Re-read the (now larger) first page.
+                        allRows = readCurrentPageRows();
+                    }
+
+                    // dtRecordsTotal is the authoritative server-side
+                    // count; we use it to know when to stop paginating
+                    // even if findNextButton() momentarily reports a
+                    // disabled state during a redraw.
+                    const dtRecordsTotal = readDtRecordsTotal();
+
                     let pageCount = 1;
+                    let consecutiveEmptyClicks = 0;
                     while (Date.now() < deadline) {
                         if (maxInvoices > 0 && allRows.length >= maxInvoices) break;
+                        if (
+                            dtRecordsTotal !== null
+                            && allRows.length >= dtRecordsTotal
+                        ) {
+                            // We've already pulled everything DataTables
+                            // says exists. Don't click into a phantom
+                            // page that would just show duplicates.
+                            break;
+                        }
                         const next = findNextButton();
-                        if (!next) break;
-                        const prevSig =
-                            `${allRows[allRows.length - 1].dataId}|first`;
+                        if (!next) {
+                            // The Next button can disappear briefly
+                            // during a DataTables redraw. Wait a tick
+                            // and look again — but only a small number
+                            // of times before giving up.
+                            consecutiveEmptyClicks++;
+                            if (consecutiveEmptyClicks >= 3) break;
+                            await sleep(intervalMs);
+                            continue;
+                        }
+                        consecutiveEmptyClicks = 0;
+                        // Signature based on FIRST visible row so we
+                        // detect the page redraw correctly. Using
+                        // allRows[allRows.length-1] as before compared
+                        // the LAST row of the accumulated set against
+                        // the FIRST row of the new page — which always
+                        // differed and so never actually validated the
+                        // change.
+                        const visibleNow = readCurrentPageRows();
+                        const prevSig = visibleNow.length === 0
+                            ? `EMPTY:0`
+                            : `${visibleNow[0].dataId}|${visibleNow.length}`;
                         // Click the button. We deliberately use the DOM
                         // click() because dispatching a synthetic event
                         // would skip jQuery handlers DataTables wires up.
@@ -1238,8 +1368,10 @@ class DianTestScraper:
                         ok: true,
                         method: pageCount > 1 ? 'dom-pagination' : 'dom-single-page',
                         recordsTotal: allRows.length,
+                        dtRecordsTotal: dtRecordsTotal,
                         rows: allRows.slice(0, maxInvoices || allRows.length),
                         pages: pageCount,
+                        pageLengthChanged: pageLengthChanged,
                     }));
                 })().catch((err) => {
                     resolve(JSON.stringify({
@@ -1288,8 +1420,15 @@ class DianTestScraper:
 
         rows_data = result.get("rows", [])
         records_total = result.get("recordsTotal", 0)
+        # `dtRecordsTotal` is what the DataTables "info" line reports as
+        # the server-side total, e.g. "del 1 al 100 de 97 registros".
+        # `records_total` above is just len(rows_data) — what we DOWNloaded.
+        # We log both so the operator can spot a mismatch (rows fell short
+        # of the server-side total → pagination cut short).
+        dt_records_total = result.get("dtRecordsTotal")
         method = result.get("method", "")
         pages = result.get("pages", 1)
+        page_length_changed = bool(result.get("pageLengthChanged"))
 
         # Edge case: result.ok is True but we got zero rows AND DIAN
         # reports recordsTotal=0. Could be a legitimately empty range,
@@ -1491,8 +1630,11 @@ class DianTestScraper:
                 status="ok",
                 notes=(
                     f"found {len(invoices)} invoices "
-                    f"(recordsTotal={records_total}, method={method}, "
-                    f"pages={pages}, max_cap={self.max_invoices}, "
+                    f"(rowsScraped={records_total}, "
+                    f"dtServerTotal={dt_records_total}, "
+                    f"method={method}, pages={pages}, "
+                    f"pageLen100={page_length_changed}, "
+                    f"max_cap={self.max_invoices}, "
                     f"skipped={skipped_count}, "
                     f"pre_filtered={total_pre_filtered})"
                 ),
