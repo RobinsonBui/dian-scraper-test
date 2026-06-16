@@ -17,8 +17,25 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code
-COPY core.py scraper.py server.py ./
+# App code. Each Python module is listed explicitly so the image
+# doesn't accidentally pick up local dev artefacts (downloads/,
+# logs/, __pycache__, .env, …). When adding a new module remember
+# to mirror it here — the CI image won't see it otherwise.
+#
+# Layout:
+#   server.py            FastAPI app + endpoints + lifespan
+#   core.py / scraper.py Playwright scrapers (core is the one the
+#                        server imports; scraper is the standalone CLI)
+#   backend.py           JobBackend Protocol + in-memory + postgres+R2
+#                        implementations. Imported by server.py at boot.
+#   db.py                asyncpg JobStore — used only when DB_MODE=postgres.
+#   r2.py                boto3 R2 client — used only when STORAGE_MODE=r2.
+#   db/bootstrap.sql     One-shot schema for the postgres container, mounted
+#                        as /docker-entrypoint-initdb.d/ in compose. The
+#                        image still ships it so an operator can re-apply
+#                        it manually from inside the container if needed.
+COPY core.py scraper.py server.py backend.py db.py r2.py ./
+COPY db ./db
 COPY static ./static
 
 # Runtime dirs (also declared as volumes in compose)

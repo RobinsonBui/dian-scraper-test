@@ -144,6 +144,20 @@
       font-size: 11px;
       line-height: 1.5;
     }
+    .form-group .hint {
+      display: block;
+      margin-top: 4px;
+      color: var(--text-dim);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    .form-group .hint code {
+      font-family: var(--mono);
+      background: var(--bg-3);
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 10.5px;
+    }
     .form-row {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -382,6 +396,18 @@
           <textarea id="authUrl" placeholder="https://catalogo-vpfe.dian.gov.co/User/AuthToken?pk=..."></textarea>
         </div>
 
+        <div class="form-group">
+          <label for="companyId">Empresa NUVARA (UUID)</label>
+          <input id="companyId" type="text" spellcheck="false"
+                 placeholder="550e8400-e29b-41d4-a716-446655440000" />
+          <small class="hint">
+            Copialo desde la URL de NUVARA, por ejemplo
+            <code>/companies/&lt;uuid&gt;/...</code>. Si lo dejás vacío,
+            los ZIPs van a quedar en R2 bajo
+            <code>dian-scraper-alt/__no_company__/...</code>.
+          </small>
+        </div>
+
         <div class="form-row">
           <div class="form-group">
             <label for="startDate">Fecha inicio</label>
@@ -483,6 +509,11 @@
       selected: null,
       stats: { total: 0, ok: 0, fail: 0, block: 0, latencies: [] },
       currentTab: 'pdf',
+      // job_id of the run we kicked off most recently. Needed by
+      // POST /api/cancel which now requires {"job_id": "..."} because
+      // the server supports concurrent jobs and there is no longer
+      // a single "current" run to target globally.
+      currentJobId: null,
     };
 
     function updateStats() {
@@ -672,7 +703,15 @@
       $('btnCancel').disabled = !running;
     }
 
+    // UUID v1..v5 shape. Loose check on purpose — the backend
+    // accepts any string as company_id (test tenants without proper
+    // UUIDs exist), but a free-form value lands in R2 under a literal
+    // sub-prefix that's a pain to clean up later. So we warn instead
+    // of bailing out so the operator has a chance to fix a typo.
+    const UUID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
     $('btnStart').addEventListener('click', async () => {
+      const companyId = $('companyId').value.trim();
       const payload = {
         auth_url: $('authUrl').value.trim(),
         start_date: $('startDate').value,
@@ -682,10 +721,23 @@
         delay_max_ms: parseInt($('delayMax').value, 10),
         long_pause_every: parseInt($('longPause').value, 10),
         headless: $('headless').checked,
+        // Only include company_id when the operator typed something.
+        // Sending an empty string would override the server-side
+        // None default and could confuse the R2 key builder.
+        ...(companyId ? { company_id: companyId } : {}),
       };
       if (!payload.auth_url) {
         alert('Pegá la auth URL primero.');
         return;
+      }
+      if (companyId && !UUID_RX.test(companyId)) {
+        const ok = confirm(
+          `"${companyId}" no parece un UUID válido.\n\n` +
+          `Si seguís, los ZIPs van a quedar en R2 bajo\n` +
+          `dian-scraper-alt/${companyId}/{job_id}/...\n\n` +
+          `¿Querés enviarlo igual?`
+        );
+        if (!ok) return;
       }
       try {
         const resp = await fetch('/api/start', {
@@ -698,6 +750,11 @@
           alert('Error: ' + (err.detail || resp.statusText));
           return;
         }
+        // Capture the job_id the server assigned so the cancel
+        // button can target this specific run. With concurrent jobs
+        // the server no longer cancels "the current run" globally.
+        const body = await resp.json();
+        state.currentJobId = body.job_id || null;
         setRunning(true);
       } catch (e) {
         alert('Error: ' + e.message);
@@ -705,7 +762,15 @@
     });
 
     $('btnCancel').addEventListener('click', async () => {
-      await fetch('/api/cancel', { method: 'POST' });
+      if (!state.currentJobId) {
+        alert('Iniciá un run primero — no hay nada para cancelar.');
+        return;
+      }
+      await fetch('/api/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: state.currentJobId }),
+      });
     });
 
     $('btnClear').addEventListener('click', () => {

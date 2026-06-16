@@ -3,3 +3,14 @@ rich>=13.7.0
 click>=8.1.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
+
+# Postgres driver — used only when DB_MODE=postgres. Pinned so the
+# build is reproducible across deploys. asyncpg is async-native and
+# much faster than psycopg under the FastAPI event loop.
+asyncpg>=0.30.0,<0.31.0
+
+# S3-compatible client for Cloudflare R2 — only loaded when
+# STORAGE_MODE=r2. boto3 + botocore add ~15MB to the image but they
+# are the lingua franca for S3-compat and survive R2 quirks (auto
+# region, path-style addressing, etc.) without custom code.
+boto3>=1.35.0,<2.0.0

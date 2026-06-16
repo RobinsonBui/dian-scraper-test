@@ -13,15 +13,49 @@
 #   Watch paths:  (leave empty — rebuild on every push)
 #
 # Volumes for downloads/ and logs/ are preserved across deploys so
-# we keep evidence between runs.
+# we keep evidence between runs. The Postgres volume holds the job
+# state — losing it forces in-flight jobs to be retried by NUVARA.
 
 services:
+  postgres:
+    # Pinned to 16 so Dokploy/Hetzner builds reproduce the same engine
+    # version across deploys. Worth upgrading deliberately, not by drift.
+    image: postgres:16-alpine
+    container_name: dian-scraper-postgres
+    restart: unless-stopped
+    environment:
+      # Defaults are fine for a single-tenant scraper DB. The container
+      # is not exposed to the outside world — only the scraper inside
+      # the same compose network reaches it.
+      - POSTGRES_USER=${POSTGRES_USER:-scraper}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-scraper_dev_password}
+      - POSTGRES_DB=${POSTGRES_DB:-dian_scraper}
+      - TZ=America/Bogota
+    volumes:
+      - dian-scraper-pgdata:/var/lib/postgresql/data
+      # Bootstrap SQL runs ONCE on a fresh DB. Idempotent enough that
+      # restarting an existing container with the same script is a no-op
+      # (we use IF NOT EXISTS everywhere). For schema changes after the
+      # first deploy use migrations from the app, not this hook.
+      - ./db/bootstrap.sql:/docker-entrypoint-initdb.d/01-bootstrap.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-scraper} -d ${POSTGRES_DB:-dian_scraper}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   dian-scraper:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: dian-scraper-test
     restart: unless-stopped
+    depends_on:
+      postgres:
+        # Wait until pg is accepting connections before starting the API.
+        # Saves us from the "Connection refused" first-boot crash loop.
+        condition: service_healthy
     ports:
       # Host:Container — Dokploy/Traefik can also route via labels,
       # but a direct port mapping makes ad-hoc testing easier.
@@ -48,6 +82,35 @@ services:
       - DEFAULT_DELAY_MIN_MS=${DEFAULT_DELAY_MIN_MS:-1000}
       - DEFAULT_DELAY_MAX_MS=${DEFAULT_DELAY_MAX_MS:-6000}
       - DEFAULT_LONG_PAUSE_EVERY=${DEFAULT_LONG_PAUSE_EVERY:-30}
+      # ──────────────────────────────────────────────────────────────
+      # Storage / state backends — feature-flagged so we can deploy
+      # this code without breaking the in-memory legacy path.
+      #
+      # STORAGE_MODE=local → ZIPs land in /app/downloads (legacy).
+      # STORAGE_MODE=r2    → ZIPs land in Cloudflare R2; the /api/jobs
+      #                      response carries r2_key + r2_url instead
+      #                      of /files/{job_id}/{name} URLs.
+      #
+      # DB_MODE=memory     → RunState lives in process RAM (legacy).
+      # DB_MODE=postgres   → RunState lives in the postgres service
+      #                      defined above. Jobs survive restarts.
+      # ──────────────────────────────────────────────────────────────
+      - STORAGE_MODE=${STORAGE_MODE:-local}
+      - DB_MODE=${DB_MODE:-memory}
+      # Internal DSN — points at the postgres service above by name.
+      # Override only when running outside this compose file.
+      - DATABASE_URL=${DATABASE_URL:-postgresql://scraper:scraper_dev_password@postgres:5432/dian_scraper}
+      # R2 / S3-compatible storage. All four required when STORAGE_MODE=r2.
+      # The bucket is the SAME R2 bucket NUVARA uses — the scraper
+      # writes under the prefix `dian-scraper-alt/{companyId}/{jobId}/`
+      # so NUVARA can read the bytes directly without an extra HTTP hop.
+      - R2_ENDPOINT=${R2_ENDPOINT:-}
+      - R2_BUCKET=${R2_BUCKET:-}
+      - R2_ACCESS_KEY=${R2_ACCESS_KEY:-}
+      - R2_SECRET_KEY=${R2_SECRET_KEY:-}
+      # Region is mostly cosmetic for R2 (S3-compat layer ignores it)
+      # but boto3 demands one; "auto" works for Cloudflare R2.
+      - R2_REGION=${R2_REGION:-auto}
     # Dokploy healthcheck consumes the unauthenticated /healthz so the
     # platform can verify liveness without exposing the API key.
     healthcheck:
@@ -60,3 +123,7 @@ services:
 volumes:
   dian-downloads:
   dian-logs:
+  # Persists job state across Dokploy redeploys. WIPE THIS only when
+  # you intentionally want to clear job history — otherwise you lose
+  # the audit trail.
+  dian-scraper-pgdata:
