@@ -665,11 +665,23 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
     log_path = LOGS_DIR / f"run-{timestamp}-{job_id[:8]}.jsonl"
     file_logger = Logger(log_path)
 
-    # We honor write_to_disk only when the backend keeps files locally.
-    # With PostgresR2JobBackend the canonical copy lives in R2 and the
-    # container's filesystem would just bloat without serving anyone.
-    write_to_disk = not isinstance(backend, PostgresR2JobBackend)
-    if write_to_disk:
+    # The engine no longer writes ZIPs directly to disk — the backend's
+    # save_file is the single point of persistence. This way the legacy
+    # InMemoryJobBackend (writes to downloads/{job_id}/{name}) and the
+    # PostgresR2JobBackend (uploads to R2) share one code path and one
+    # invariant: a file is on disk / in R2 iff it has a job_files row.
+    #
+    # Why we don't let core.py write too:
+    #   - Double write in legacy mode (same bytes, same path) is benign
+    #     but wastes IO and confuses anyone reading the code.
+    #   - The audit trail would say "file written" twice for one ZIP.
+    #   - The two paths could drift; this keeps them lockstep.
+    write_to_disk = False
+    # We still create the per-job downloads subdir up front in legacy
+    # mode so InMemoryJobBackend.save_file's mkdir() never races with
+    # concurrent jobs trying to mkdir the same parent. Skipped in R2
+    # mode because we don't want to leave empty dirs lying around.
+    if not isinstance(backend, PostgresR2JobBackend):
         (DOWNLOADS_DIR / job_id).mkdir(parents=True, exist_ok=True)
 
     # --- Helpers bound to this job ---------------------------------------
