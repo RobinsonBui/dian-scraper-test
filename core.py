@@ -59,6 +59,25 @@ def _parse_proxy_url(url: str | None) -> dict[str, str] | None:
         proxy["password"] = unquote(parsed.password)
     return proxy
 
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float from env with a fallback.
+
+    Mirrors `server._env_int`: empty / malformed / non-positive values
+    fall back to the default so a typo in Dokploy → Environment can't
+    silently shrink an important timeout to zero. Centralised here so
+    `core.py` doesn't have to import from `server.py`.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
 DIAN_BASE_URL = "https://catalogo-vpfe.dian.gov.co"
 RECEIVED_URL = f"{DIAN_BASE_URL}/Document/Received"
 GETFILE_PDF_URL = f"{DIAN_BASE_URL}/Document/GetFilePdf"
@@ -648,8 +667,58 @@ class DianTestScraper:
         await self.page.goto(
             self.auth_url, wait_until="domcontentloaded", timeout=120000
         )
-        await asyncio.sleep(2)
+        # DIAN sits behind Azure WAF, which often serves a JS challenge
+        # (title 'Azure WAF', body 'Un momento, estamos comprobando
+        # que no sea un bot') before letting us through to the real
+        # portal. The challenge resolves itself in 3-15 s when the
+        # browser is realistic enough (Camoufox/Firefox passes it),
+        # but during that window `page.url` keeps showing the
+        # original /User/AuthToken URL — so a single check 2 s in
+        # would always conclude "stuck on /User/Auth" even on
+        # otherwise healthy runs.
+        #
+        # We poll instead: every second, check whether we left the
+        # auth/login path. The moment the URL moves to the inbox we
+        # break out; if the budget runs out we capture diagnostics
+        # and raise. Two budgets so the operator can tune via env:
+        #   AUTH_WAIT_TIMEOUT_S       hard ceiling (default 30 s)
+        #   AUTH_WAIT_POLL_INTERVAL_S sleep between checks (default 1 s)
+        timeout_s = _env_float("AUTH_WAIT_TIMEOUT_S", 30.0)
+        poll_s = max(0.25, _env_float("AUTH_WAIT_POLL_INTERVAL_S", 1.0))
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        loop = asyncio.get_event_loop()
+        announced_wait = False
         current_url = self.page.url
+        while True:
+            current_url = self.page.url
+            if not (
+                "login" in current_url.lower()
+                or "/User/Auth" in current_url
+            ):
+                break
+            if not announced_wait:
+                # Emit once so the UI shows "still waiting on the WAF
+                # challenge" instead of looking frozen. We don't spam
+                # an event per second because the log is already noisy.
+                await self._emit(
+                    DownloadEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        sequence=0,
+                        cufe="",
+                        prefijo_folio="",
+                        phase="log",
+                        status="info",
+                        notes=(
+                            f"Still on auth path, waiting for WAF "
+                            f"challenge to resolve (up to {timeout_s:.0f}s)..."
+                        ),
+                    )
+                )
+                announced_wait = True
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(poll_s)
+
         if "login" in current_url.lower() or "/User/Auth" in current_url:
             # Diagnostics: when DIAN rejects the auth URL we have no
             # idea WHAT they served the scraper without seeing it. We
