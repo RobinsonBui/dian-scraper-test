@@ -870,10 +870,33 @@
     // of bailing out so the operator has a chance to fix a typo.
     const UUID_RX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+    // DIAN's auth URLs are emitted with a literal `|` between the
+    // pk fragments (`pk=10910094|1040327786`). Most desktop/web mail
+    // clients silently URL-encode that pipe to `%7C` when the user
+    // copies the link, and the DIAN portal rejects the encoded form
+    // by redirecting straight to /User/Auth — the scraper then
+    // surfaces it as "Auth URL expired or invalid".
+    //
+    // We undo the encoding here so the operator doesn't have to
+    // hand-edit the URL every time. Limited to the pipe character;
+    // we don't blanket-decode the whole URL because tokens may
+    // legitimately contain percent-encoded bytes elsewhere.
+    function sanitizeAuthUrl(raw) {
+      return raw.trim().replace(/%7C/gi, '|');
+    }
+
     $('btnStart').addEventListener('click', async () => {
       const companyId = $('companyId').value.trim();
+      const rawAuth = $('authUrl').value;
+      const cleanAuth = sanitizeAuthUrl(rawAuth);
+      // Reflect the cleaned URL back into the textarea so the
+      // operator can see exactly what we sent — saves a confusing
+      // "but I pasted X, why does the log say Y" moment.
+      if (cleanAuth !== rawAuth.trim()) {
+        $('authUrl').value = cleanAuth;
+      }
       const payload = {
-        auth_url: $('authUrl').value.trim(),
+        auth_url: cleanAuth,
         start_date: $('startDate').value,
         end_date: $('endDate').value,
         max_invoices: parseInt($('maxInvoices').value, 10),
