@@ -874,83 +874,43 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
         # opaque 'failed' status they always did).
         terminal_error_kind: str | None = None
         summary: dict[str, Any] | None = None
+        # ScraperError instances need scraper.logger.summary() AFTER the
+        # except branch picks them up — we keep a reference outside the
+        # `async with` so the post-flight branch can read it without
+        # touching the closed scraper.
+        scraper_ref: DianTestScraper | None = None
+        # When True we've already marked the job's terminal state and
+        # emitted the lifecycle event. The `finally` block uses this to
+        # avoid double-marking when the browser cleanup raises.
+        marked_terminal: bool = False
 
-        try:
-            async with DianTestScraper(
-                auth_url=req.auth_url,
-                start_date=req.start_date,
-                end_date=req.end_date,
-                max_invoices=req.max_invoices,
-                downloads_dir=DOWNLOADS_DIR / job_id,
-                logger=file_logger,
-                progress_callback=on_engine_event,
-                file_callback=on_file_saved,
-                write_to_disk=write_to_disk,
-                headless=req.headless,
-                delay_min_ms=req.delay_min_ms,
-                delay_max_ms=req.delay_max_ms,
-                long_pause_every=req.long_pause_every,
-                # The consumer's known-CUFE list lands here. core
-                # filters them out at listing time so the per-CUFE
-                # download loop never sees them.
-                skip_cufes=req.skip_cufes,
-                # Which DIAN bucket to navigate to. core uses
-                # /Document/Received for 'purchase' (default) and
-                # /Document/Sent for 'sale'. The DataTables form
-                # layout is identical on both, so the rest of the
-                # engine is direction-agnostic.
-                direction=req.direction,
-                cancel_event=cancel_event,
-            ) as scraper:
-                summary = await scraper.run()
-                terminal_status = (
-                    "cancelled" if cancel_event.is_set() else "completed"
-                )
-                await _emit_event(
-                    job_id=job_id,
-                    source="engine",
-                    phase="summary",
-                    status="info",
-                    message=(
-                        f"Engine summary: total={summary.get('total')} "
-                        f"ok={summary.get('ok')} failed={summary.get('failed')}"
-                    ),
-                    payload=summary,
-                )
-        except asyncio.CancelledError:
-            # Task was cancelled hard (lifespan shutdown). Best-effort
-            # mark and re-raise so the cancellation propagates.
-            terminal_status = "cancelled"
-            terminal_error = "Cancelled by server shutdown"
-            raise
-        except ScraperError as e:
-            # Typed engine error: forward both the message AND the kind.
-            terminal_status = "failed"
-            terminal_error = str(e)
-            terminal_error_kind = e.kind
-            # When the engine surrenders mid-run after some files were
-            # already persisted, preserve whatever stats we have so the
-            # consumer can show "9 of 30 were saved before DIAN gave up".
-            try:
-                summary = scraper.logger.summary()
-            except Exception:
-                summary = None
-            await emit_lifecycle(
-                "failed",
-                f"[{e.kind}] {terminal_error}",
-            )
-        except Exception as e:
-            terminal_status = "failed"
-            terminal_error = f"{type(e).__name__}: {e}"
-            terminal_error_kind = ERROR_KIND_ENGINE_CRASH
-            await emit_lifecycle("failed", terminal_error)
-        finally:
-            hb_task.cancel()
-            try:
-                await hb_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        async def _mark_terminal_once() -> None:
+            """Persist terminal status + emit lifecycle event exactly once.
 
+            Why this exists: we used to do this work in the outer
+            `finally` block, AFTER the `async with DianTestScraper(...)`
+            had finished its `__aexit__` (browser teardown). On every
+            run that did paginated DOM scraping, Playwright's
+            `context.close()` / `browser.close()` calls in __aexit__
+            could block for 30-120s waiting on in-flight requests
+            (downloads, navigations, network idle handlers).
+
+            During that window NUVARA's `pollJobUntilDone` saw `status =
+            running` because we hadn't called `backend.mark_completed`
+            yet — even though every invoice was already downloaded,
+            persisted to R2, and emitted via `on_file_saved`. Operators
+            reported "NUVARA quedó en `en curso` aunque el scraper ya
+            terminó hace rato". This bug.
+
+            We now mark terminal IMMEDIATELY after the engine returns
+            from `.run()` (or raises), BEFORE the `async with` exits.
+            Browser cleanup still runs in its own finally and is best-
+            effort; if it crashes we don't undo the terminal mark.
+            """
+            nonlocal marked_terminal
+            if marked_terminal:
+                return
+            marked_terminal = True
             try:
                 if terminal_status == "completed" and summary is not None:
                     await backend.mark_completed(
@@ -971,16 +931,138 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
                 logger.exception(
                     "Could not record terminal state for job %s", job_id,
                 )
+            try:
+                await emit_lifecycle(
+                    terminal_status, f"Estado final: {terminal_status}",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not emit terminal lifecycle event for job %s",
+                    job_id,
+                )
 
-            await emit_lifecycle(
-                terminal_status, f"Estado final: {terminal_status}",
-            )
+        try:
+            try:
+                async with DianTestScraper(
+                    auth_url=req.auth_url,
+                    start_date=req.start_date,
+                    end_date=req.end_date,
+                    max_invoices=req.max_invoices,
+                    downloads_dir=DOWNLOADS_DIR / job_id,
+                    logger=file_logger,
+                    progress_callback=on_engine_event,
+                    file_callback=on_file_saved,
+                    write_to_disk=write_to_disk,
+                    headless=req.headless,
+                    delay_min_ms=req.delay_min_ms,
+                    delay_max_ms=req.delay_max_ms,
+                    long_pause_every=req.long_pause_every,
+                    # The consumer's known-CUFE list lands here. core
+                    # filters them out at listing time so the per-CUFE
+                    # download loop never sees them.
+                    skip_cufes=req.skip_cufes,
+                    # Which DIAN bucket to navigate to. core uses
+                    # /Document/Received for 'purchase' (default) and
+                    # /Document/Sent for 'sale'. The DataTables form
+                    # layout is identical on both, so the rest of the
+                    # engine is direction-agnostic.
+                    direction=req.direction,
+                    cancel_event=cancel_event,
+                ) as scraper:
+                    scraper_ref = scraper
+                    try:
+                        summary = await scraper.run()
+                        terminal_status = (
+                            "cancelled" if cancel_event.is_set() else "completed"
+                        )
+                        await _emit_event(
+                            job_id=job_id,
+                            source="engine",
+                            phase="summary",
+                            status="info",
+                            message=(
+                                f"Engine summary: total={summary.get('total')} "
+                                f"ok={summary.get('ok')} failed={summary.get('failed')}"
+                            ),
+                            payload=summary,
+                        )
+                    except asyncio.CancelledError:
+                        terminal_status = "cancelled"
+                        terminal_error = "Cancelled by server shutdown"
+                        # Mark terminal NOW so NUVARA sees `cancelled`
+                        # without waiting for browser teardown.
+                        await _mark_terminal_once()
+                        raise
+                    except ScraperError as e:
+                        terminal_status = "failed"
+                        terminal_error = str(e)
+                        terminal_error_kind = e.kind
+                        try:
+                            summary = scraper.logger.summary()
+                        except Exception:
+                            summary = None
+                        try:
+                            await emit_lifecycle(
+                                "failed",
+                                f"[{e.kind}] {terminal_error}",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not emit failure lifecycle event for job %s",
+                                job_id,
+                            )
+                    except Exception as e:
+                        terminal_status = "failed"
+                        terminal_error = f"{type(e).__name__}: {e}"
+                        terminal_error_kind = ERROR_KIND_ENGINE_CRASH
+                        try:
+                            await emit_lifecycle("failed", terminal_error)
+                        except Exception:
+                            logger.exception(
+                                "Could not emit crash lifecycle event for job %s",
+                                job_id,
+                            )
+
+                    # Mark terminal BEFORE leaving the `async with`. The
+                    # `__aexit__` that follows can block on Playwright
+                    # teardown for tens of seconds; NUVARA shouldn't
+                    # wait for that to learn the job is done.
+                    await _mark_terminal_once()
+            except asyncio.CancelledError:
+                # Re-raise so the cancellation propagates to the worker
+                # task — _mark_terminal_once was already called inside
+                # the inner try.
+                raise
+            except Exception:
+                # The `async with` itself raised during __aexit__ (most
+                # likely Playwright failing to close the browser). We
+                # already marked terminal inside; just log so the
+                # operator can spot a recurring teardown issue.
+                logger.exception(
+                    "Browser teardown raised after terminal mark for job %s",
+                    job_id,
+                )
+        finally:
+            hb_task.cancel()
+            try:
+                await hb_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+            # Belt-and-suspenders: if we somehow never marked terminal
+            # (e.g. an exception fired BEFORE entering the inner
+            # try/except), do it now so the job never strands as
+            # `running`. _mark_terminal_once guards re-entry.
+            await _mark_terminal_once()
 
             file_logger.close()
             # Cleanup per-job in-process state. We do NOT delete from
             # the backend — that's the historical record.
             cancel_events.pop(job_id, None)
             running_tasks.pop(job_id, None)
+            # Reference cleanup so the closed scraper doesn't pin the
+            # browser context in memory.
+            scraper_ref = None  # noqa: F841
 
 
 async def _emit_event(

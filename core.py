@@ -712,30 +712,55 @@ class DianTestScraper:
         self.page = await self.context.new_page()
 
     async def __aexit__(self, *args: Any) -> None:
-        try:
-            if self.context:
-                await self.context.close()
-        except Exception:
-            pass
-        try:
-            if self.browser:
-                await self.browser.close()
-        except Exception:
-            pass
+        """Best-effort browser teardown with per-step timeouts.
+
+        Why each call is wrapped in `asyncio.wait_for`: Playwright's
+        `.close()` methods can block indefinitely when there are
+        in-flight requests, hanging downloads, or stuck network-idle
+        handlers — patterns that happen routinely when a paginated
+        listing was still draining at the moment the engine returned.
+        Without a timeout here, `__aexit__` could pin the worker task
+        for minutes, which used to delay the job's terminal mark on
+        the server side (the consumer would see `status=running` long
+        after every invoice had been processed).
+
+        Timeouts are intentionally generous (10s each) — most clean
+        shutdowns finish in under 1s, and aborting in the rare slow
+        case is preferable to blocking forever. Each step swallows
+        BOTH timeouts and exceptions so a stuck `context.close()`
+        doesn't prevent `browser.close()` from being attempted.
+        """
+        teardown_timeout_s = 10.0
+
+        async def _safe_close(coro: Awaitable[Any], label: str) -> None:
+            try:
+                await asyncio.wait_for(coro, timeout=teardown_timeout_s)
+            except asyncio.TimeoutError:
+                # Log so a recurring slow teardown is observable.
+                # We don't fail the run — the scraper's work is done.
+                try:
+                    self.logger.warning(
+                        "Browser teardown step %s timed out after %.1fs",
+                        label,
+                        teardown_timeout_s,
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        if self.context:
+            await _safe_close(self.context.close(), "context.close")
+        if self.browser:
+            await _safe_close(self.browser.close(), "browser.close")
         # Tear down whichever engine driver we used. Both paths are
         # best-effort — failures during shutdown shouldn't mask the
         # original error that may have triggered the exit.
-        try:
-            if self.pw:
-                await self.pw.stop()
-        except Exception:
-            pass
-        try:
-            ctx = getattr(self, "_camoufox_ctx", None)
-            if ctx is not None:
-                await ctx.__aexit__(None, None, None)
-        except Exception:
-            pass
+        if self.pw:
+            await _safe_close(self.pw.stop(), "playwright.stop")
+        ctx = getattr(self, "_camoufox_ctx", None)
+        if ctx is not None:
+            await _safe_close(ctx.__aexit__(None, None, None), "camoufox.__aexit__")
 
     async def authenticate(self) -> None:
         assert self.page is not None
