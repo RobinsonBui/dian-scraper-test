@@ -355,6 +355,125 @@ class DianTestScraper:
         except Exception:
             pass
 
+    async def _snapshot_for_diagnostics(
+        self, *, tag: str, landed_url: str,
+    ) -> None:
+        """Capture screenshot + HTML of the current page and ship them
+        to the consumer as `<tag>.png` and `<tag>.html` files.
+
+        Lives next to `_emit_file` because it uses the same channel:
+        when the caller wired a `file_callback` we hand the bytes
+        over there (server.py persists to the backend, which in
+        legacy mode means the operator can grab them from
+        /files/{job_id}/<tag>.png).
+
+        Best-effort by design. If the browser is already dead or the
+        callback throws, we log a single event and move on — the
+        caller is in the middle of raising a more important error
+        and we don't want to mask it.
+        """
+        # Emit a marker event first so the operator sees the
+        # diagnostic was attempted even if the snapshot itself fails.
+        await self._emit(
+            DownloadEvent(
+                timestamp=datetime.utcnow().isoformat(),
+                sequence=0,
+                cufe="",
+                prefijo_folio="",
+                phase="auth_diagnostics",
+                status="info",
+                notes=(
+                    f"Capturing snapshot ({tag}). Landed URL: "
+                    f"{landed_url[:200]}"
+                ),
+            )
+        )
+
+        if self.page is None or self.file_callback is None:
+            return
+
+        try:
+            png_bytes = await self.page.screenshot(full_page=True)
+        except Exception as e:
+            await self._emit(
+                DownloadEvent(
+                    timestamp=datetime.utcnow().isoformat(),
+                    sequence=0,
+                    cufe="",
+                    prefijo_folio="",
+                    phase="auth_diagnostics",
+                    status="fail",
+                    notes=f"screenshot capture failed: {type(e).__name__}: {e}",
+                )
+            )
+            png_bytes = None
+
+        try:
+            html_text = await self.page.content()
+            html_bytes = html_text.encode("utf-8", errors="replace")
+        except Exception as e:
+            await self._emit(
+                DownloadEvent(
+                    timestamp=datetime.utcnow().isoformat(),
+                    sequence=0,
+                    cufe="",
+                    prefijo_folio="",
+                    phase="auth_diagnostics",
+                    status="fail",
+                    notes=f"html capture failed: {type(e).__name__}: {e}",
+                )
+            )
+            html_bytes = None
+
+        # Ship whatever we managed to capture. The cufe / folio fields
+        # don't apply to a diagnostic; we feed empty strings so the
+        # backend's row still has a stable shape.
+        for kind, name, body in (
+            ("png", f"{tag}.png", png_bytes),
+            ("html", f"{tag}.html", html_bytes),
+        ):
+            if not body:
+                continue
+            try:
+                await self.file_callback(
+                    FileSavedEvent(
+                        cufe="",
+                        prefijo_folio="",
+                        issuer_nit=None,
+                        issue_date=None,
+                        filename=name,
+                        body=body,
+                        size_bytes=len(body),
+                        sequence=0,
+                    )
+                )
+                await self._emit(
+                    DownloadEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        sequence=0,
+                        cufe="",
+                        prefijo_folio="",
+                        phase="auth_diagnostics",
+                        status="ok",
+                        notes=(
+                            f"snapshot saved: {name} ({len(body)} bytes). "
+                            f"Fetch with GET /files/{{job_id}}/{name}."
+                        ),
+                    )
+                )
+            except Exception as e:
+                await self._emit(
+                    DownloadEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        sequence=0,
+                        cufe="",
+                        prefijo_folio="",
+                        phase="auth_diagnostics",
+                        status="fail",
+                        notes=f"save {name} failed: {type(e).__name__}: {e}",
+                    )
+                )
+
     async def __aenter__(self) -> "DianTestScraper":
         self.pw = await async_playwright().start()
 
@@ -424,6 +543,22 @@ class DianTestScraper:
         await asyncio.sleep(2)
         current_url = self.page.url
         if "login" in current_url.lower() or "/User/Auth" in current_url:
+            # Diagnostics: when DIAN rejects the auth URL we have no
+            # idea WHAT they served the scraper without seeing it. We
+            # snapshot the landing page (HTML + screenshot) and hand
+            # them to the consumer via the file_callback so the
+            # operator can open them after the fact. This is the
+            # next-best thing to attaching a debugger and saves a
+            # round-trip of "can you also paste the page source".
+            #
+            # If anything in the snapshot itself fails (Playwright
+            # already torn down, callback raises) we swallow it: the
+            # original RuntimeError is more important than perfect
+            # diagnostics.
+            await self._snapshot_for_diagnostics(
+                tag="auth-failed",
+                landed_url=current_url,
+            )
             raise RuntimeError(
                 "Auth URL expired or invalid. Re-login in DIAN and copy a fresh URL."
             )
