@@ -188,6 +188,47 @@ FileCallback = Callable[[FileSavedEvent], Awaitable[None]]
 
 
 # --------------------------------------------------------------------------
+# Error classification
+# --------------------------------------------------------------------------
+#
+# Five mutually-exclusive kinds the consumer (NUVARA) can map to a
+# context-aware UI message. The strings are deliberately stable
+# (snake_case, no version suffix) so a NUVARA update isn't required
+# every time we touch the scraper.
+#
+#   auth_expired       — DIAN's auth URL was rejected at the start of
+#                        the run (single-use token, expired, etc.)
+#   auth_expired_midrun — DIAN started redirecting to /login after
+#                        downloads had already begun (session went
+#                        away mid-job; partial results stay)
+#   captcha_blocked    — Azure WAF served a JS challenge we couldn't
+#                        get past inside the auth wait budget
+#   timeout            — the global job budget elapsed
+#   engine_crash       — unhandled exception in the Playwright engine
+#                        (the only "we don't really know" bucket)
+
+ERROR_KIND_AUTH_EXPIRED = "auth_expired"
+ERROR_KIND_AUTH_EXPIRED_MIDRUN = "auth_expired_midrun"
+ERROR_KIND_CAPTCHA_BLOCKED = "captcha_blocked"
+ERROR_KIND_TIMEOUT = "timeout"
+ERROR_KIND_ENGINE_CRASH = "engine_crash"
+
+
+class ScraperError(RuntimeError):
+    """Engine-side error with a classified `kind`.
+
+    Subclass of RuntimeError so any existing `except RuntimeError`
+    catch sites keep working — the new attribute is purely additive.
+    server.py reads `kind` to populate the job row's `error_kind`
+    column, which NUVARA then turns into an actionable UI message.
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+# --------------------------------------------------------------------------
 # Logger
 # --------------------------------------------------------------------------
 
@@ -752,21 +793,43 @@ class DianTestScraper:
             # idea WHAT they served the scraper without seeing it. We
             # snapshot the landing page (HTML + screenshot) and hand
             # them to the consumer via the file_callback so the
-            # operator can open them after the fact. This is the
-            # next-best thing to attaching a debugger and saves a
-            # round-trip of "can you also paste the page source".
-            #
-            # If anything in the snapshot itself fails (Playwright
-            # already torn down, callback raises) we swallow it: the
-            # original RuntimeError is more important than perfect
-            # diagnostics.
+            # operator can open them after the fact.
             await self._snapshot_for_diagnostics(
                 tag="auth-failed",
                 landed_url=current_url,
             )
-            raise RuntimeError(
-                "Auth URL expired or invalid. Re-login in DIAN and copy a fresh URL."
+
+            # Try to distinguish "WAF challenge we couldn't pass"
+            # (browser fingerprint trips Azure's bot detection) from
+            # "expired token" (DIAN's auth_url is single-use and we
+            # got it after it was already consumed). Both land on
+            # /User/Auth, but the WAF case has very telltale HTML.
+            error_kind = ERROR_KIND_AUTH_EXPIRED
+            message = (
+                "Auth URL expired or invalid. "
+                "Re-login in DIAN and copy a fresh URL."
             )
+            try:
+                if self.page is not None:
+                    html = await self.page.content()
+                    html_lower = html.lower()
+                    if (
+                        "<title>azure waf</title>" in html_lower
+                        or "comprobando que no sea un bot" in html_lower
+                        or "/.azwaf/" in html
+                    ):
+                        error_kind = ERROR_KIND_CAPTCHA_BLOCKED
+                        message = (
+                            "Azure WAF blocked the session before we "
+                            "could read the DIAN portal. "
+                            "Wait a few minutes and retry."
+                        )
+            except Exception:
+                # HTML probe is best-effort; the original auth_expired
+                # classification is a safe default.
+                pass
+
+            raise ScraperError(error_kind, message)
         await self._emit(
             DownloadEvent(
                 timestamp=datetime.utcnow().isoformat(),
@@ -1578,6 +1641,15 @@ class DianTestScraper:
             return self.logger.summary()
 
         consecutive_blocks = 0
+        # Mid-run deauth detection: when DIAN's session quietly expires
+        # mid-job we keep getting redirected to /login, which surfaces
+        # as fail/block downloads. Counter wakes up the moment a
+        # download isn't OK; we sniff the current page URL and if it's
+        # on the auth path we raise a typed ScraperError after the
+        # second consecutive non-ok. Partial successes already
+        # collected via file_callback stay in the consumer's hands.
+        consecutive_non_ok = 0
+        DEAUTH_THRESHOLD = 2
         for i, invoice in enumerate(invoices, start=1):
             if self.cancel_event.is_set():
                 await self._emit(
@@ -1599,6 +1671,59 @@ class DianTestScraper:
 
             event = await self.download_invoice(invoice, i)
             await self._emit(event)
+
+            if event.status == "ok":
+                consecutive_non_ok = 0
+            else:
+                consecutive_non_ok += 1
+                if consecutive_non_ok >= DEAUTH_THRESHOLD:
+                    # Sniff the live URL. If DIAN bumped us back to the
+                    # login wall the rest of the run is doomed — abort
+                    # with a typed error so the consumer can tell the
+                    # operator "ask for a new token".
+                    current_url = ""
+                    try:
+                        if self.page is not None:
+                            current_url = self.page.url or ""
+                    except Exception:
+                        current_url = ""
+                    if (
+                        "login" in current_url.lower()
+                        or "/User/Auth" in current_url
+                    ):
+                        await self._emit(
+                            DownloadEvent(
+                                timestamp=datetime.utcnow().isoformat(),
+                                sequence=i,
+                                cufe="",
+                                prefijo_folio="",
+                                phase="summary",
+                                status="fail",
+                                notes=(
+                                    f"DIAN redirected to {current_url[:120]} "
+                                    f"after {consecutive_non_ok} failed "
+                                    f"downloads — session expired mid-run."
+                                ),
+                            )
+                        )
+                        # Snapshot so the operator can confirm in the
+                        # UI exactly what DIAN was showing.
+                        try:
+                            await self._snapshot_for_diagnostics(
+                                tag="midrun-deauth",
+                                landed_url=current_url,
+                            )
+                        except Exception:
+                            pass
+                        raise ScraperError(
+                            ERROR_KIND_AUTH_EXPIRED_MIDRUN,
+                            (
+                                "DIAN session expired mid-run. "
+                                f"{len([e for e in self.logger.events if e.phase == 'download' and e.status == 'ok'])} "
+                                "files were saved before the session went "
+                                "away; the rest need a fresh token."
+                            ),
+                        )
 
             if event.status == "block":
                 consecutive_blocks += 1

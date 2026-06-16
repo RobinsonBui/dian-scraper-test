@@ -54,10 +54,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend import JobBackend, PostgresR2JobBackend, build_backend
 from core import (
+    ERROR_KIND_ENGINE_CRASH,
     DianTestScraper,
     DownloadEvent,
     FileSavedEvent,
     Logger,
+    ScraperError,
 )
 from db import JobFileRow, JobRow
 
@@ -371,7 +373,12 @@ class StartRequest(BaseModel):
     auth_url: str
     start_date: str = Field(..., description="YYYY-MM-DD")
     end_date: str = Field(..., description="YYYY-MM-DD")
-    max_invoices: int = 30
+    # 300 is the new default (was 30). Covers a tenant with very heavy
+    # B2B billing without hitting the cap, while still bounded enough
+    # that a runaway run can't pin the worker for hours. NUVARA's UI
+    # surfaces this so the operator can lower or raise it per-run when
+    # a smaller / bigger window is needed.
+    max_invoices: int = 300
     headless: bool = True
     # NUVARA tenant the job belongs to. Optional so the human UI on
     # the scraper itself (no tenant context) still works; M2M callers
@@ -849,6 +856,12 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
         hb_task = asyncio.create_task(heartbeat_loop())
         terminal_status: str = "failed"
         terminal_error: str | None = None
+        # When the scraper raises a ScraperError (auth_expired,
+        # captcha_blocked, etc.) we forward its `kind` so NUVARA can
+        # render an actionable message instead of a generic stack
+        # trace. Defaults to None (legacy callers will see the same
+        # opaque 'failed' status they always did).
+        terminal_error_kind: str | None = None
         summary: dict[str, Any] | None = None
 
         try:
@@ -893,9 +906,26 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
             terminal_status = "cancelled"
             terminal_error = "Cancelled by server shutdown"
             raise
+        except ScraperError as e:
+            # Typed engine error: forward both the message AND the kind.
+            terminal_status = "failed"
+            terminal_error = str(e)
+            terminal_error_kind = e.kind
+            # When the engine surrenders mid-run after some files were
+            # already persisted, preserve whatever stats we have so the
+            # consumer can show "9 of 30 were saved before DIAN gave up".
+            try:
+                summary = scraper.logger.summary()
+            except Exception:
+                summary = None
+            await emit_lifecycle(
+                "failed",
+                f"[{e.kind}] {terminal_error}",
+            )
         except Exception as e:
             terminal_status = "failed"
             terminal_error = f"{type(e).__name__}: {e}"
+            terminal_error_kind = ERROR_KIND_ENGINE_CRASH
             await emit_lifecycle("failed", terminal_error)
         finally:
             hb_task.cancel()
@@ -918,6 +948,7 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
                     await backend.mark_failed(
                         job_id=job_id,
                         error=terminal_error or "Unknown failure",
+                        error_kind=terminal_error_kind,
                     )
             except Exception:
                 logger.exception(
@@ -1064,6 +1095,12 @@ def _job_to_dict(row: JobRow, files: list[JobFileRow]) -> dict[str, Any]:
         ),
         "summary": row.summary,
         "error": row.error,
+        # NUVARA reads this to render a contextual UI message instead
+        # of a stack trace. Stable string vocabulary documented in
+        # core.py (auth_expired / auth_expired_midrun / captcha_blocked
+        # / timeout / engine_crash). Null on completed runs and on
+        # rows the legacy engine couldn't classify.
+        "error_kind": row.error_kind,
         "files": [_file_to_dict(f) for f in files],
     }
 

@@ -87,7 +87,9 @@ class JobBackend(Protocol):
         self, *, job_id: str, summary: dict[str, Any],
     ) -> None: ...
 
-    async def mark_failed(self, *, job_id: str, error: str) -> None: ...
+    async def mark_failed(
+        self, *, job_id: str, error: str, error_kind: Optional[str] = None,
+    ) -> None: ...
 
     async def mark_cancelled(
         self, *, job_id: str, reason: str,
@@ -429,7 +431,9 @@ class InMemoryJobBackend:
                 worker_heartbeat=None,
             )
 
-    async def mark_failed(self, *, job_id: str, error: str) -> None:
+    async def mark_failed(
+        self, *, job_id: str, error: str, error_kind: Optional[str] = None,
+    ) -> None:
         async with self._lock:
             rec = self._jobs.get(job_id)
             if rec is None:
@@ -438,6 +442,7 @@ class InMemoryJobBackend:
                 rec.row,
                 status="failed",
                 error=error,
+                error_kind=error_kind,
                 finished_at=_utcnow(),
                 worker_heartbeat=None,
             )

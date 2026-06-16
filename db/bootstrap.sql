@@ -63,8 +63,23 @@ CREATE TABLE IF NOT EXISTS jobs (
   summary             JSONB,
 
   -- Free-form error text when status='failed'.
-  error               TEXT
+  error               TEXT,
+
+  -- Classified error kind, stable vocabulary the consumer (NUVARA)
+  -- maps to a context-aware UI message:
+  --   auth_expired         single-use token had already been consumed
+  --   auth_expired_midrun  session lapsed after some downloads
+  --   captcha_blocked      WAF held the browser out of the portal
+  --   timeout              hit the global job budget
+  --   engine_crash         unhandled exception in the Playwright loop
+  -- NULL for completed/cancelled runs and legacy rows.
+  error_kind          TEXT
 );
+
+-- Idempotent ALTER for databases that were bootstrapped before
+-- error_kind existed. Safe to re-run on every container start.
+ALTER TABLE jobs
+  ADD COLUMN IF NOT EXISTS error_kind TEXT;
 
 CREATE INDEX IF NOT EXISTS jobs_status_heartbeat_idx
   ON jobs (status, worker_heartbeat)

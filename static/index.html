@@ -507,7 +507,13 @@
 
         <div class="form-group">
           <label for="maxInvoices">Máx facturas</label>
-          <input id="maxInvoices" type="number" value="30" min="1" max="500" />
+          <input id="maxInvoices" type="number" value="300" min="1" max="1000" />
+          <small class="hint">
+            Tope superior de facturas que el scraper procesa en este
+            run. Default <code>300</code> cubre una empresa con
+            movimiento alto; bajalo para correr una prueba rápida o
+            subilo si vas a sincronizar un rango largo.
+          </small>
         </div>
 
         <div class="form-row">

@@ -72,6 +72,11 @@ class JobRow:
     finished_at: Optional[datetime]
     summary: Optional[dict[str, Any]]
     error: Optional[str]
+    # Classified error kind from the engine. Stable string vocabulary
+    # the consumer (NUVARA) maps to a context-aware UI message:
+    # auth_expired / auth_expired_midrun / captcha_blocked / timeout /
+    # engine_crash. None for successful runs and legacy rows.
+    error_kind: Optional[str] = None
 
 
 @dataclass
@@ -282,20 +287,25 @@ class JobStore:
         *,
         job_id: str,
         error: str,
+        error_kind: Optional[str] = None,
     ) -> None:
         """Terminal-failure transition. The reason is stored verbatim
         so operators can copy it into a ticket without redaction.
+        `error_kind` is the engine's classified label (auth_expired,
+        captcha_blocked, etc.) and stays NULL for legacy crashes the
+        engine couldn't classify.
         """
         await self._pool.execute(
             """
             UPDATE jobs
             SET status = 'failed',
                 error = $2,
+                error_kind = $3,
                 finished_at = now(),
                 worker_heartbeat = NULL
             WHERE id = $1
             """,
-            job_id, error,
+            job_id, error, error_kind,
         )
 
     async def mark_cancelled(
@@ -490,6 +500,16 @@ class JobStore:
 
     @staticmethod
     def _job_row(row: asyncpg.Record) -> JobRow:
+        # `error_kind` is optional in the schema (added by an additive
+        # ALTER) so legacy rows return None via dict-style access on
+        # the asyncpg Record. We use `.get`-style defensive access
+        # because asyncpg raises KeyError when the column doesn't
+        # exist — the bootstrap.sql now always includes it, but a
+        # mid-deploy state could briefly lack it.
+        try:
+            error_kind = row["error_kind"]
+        except (KeyError, IndexError):
+            error_kind = None
         return JobRow(
             id=row["id"],
             company_id=row["company_id"],
@@ -505,6 +525,7 @@ class JobStore:
             finished_at=row["finished_at"],
             summary=row["summary"],
             error=row["error"],
+            error_kind=error_kind,
         )
 
     @staticmethod
