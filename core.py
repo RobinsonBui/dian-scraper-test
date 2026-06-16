@@ -3,7 +3,10 @@
 This module exposes:
 - `DianTestScraper` — the same Playwright-based scraper, but with a
   `progress_callback` so the web server can stream updates over WebSocket.
-- `DownloadEvent` — structured event.
+- `DownloadEvent` — structured event for the live log.
+- `FileSavedEvent` — structured event for "a ZIP was downloaded" — carries
+  the actual bytes so the consumer (server.py) can persist them to its
+  backend of choice (filesystem, R2, …) without re-reading from disk.
 - `InvoiceRow` — row from DIAN listing.
 """
 
@@ -117,6 +120,52 @@ class DownloadEvent:
 
 
 ProgressCallback = Callable[[DownloadEvent], Awaitable[None]]
+
+
+# --------------------------------------------------------------------------
+# File hook — "I just downloaded this ZIP, here are the bytes"
+# --------------------------------------------------------------------------
+#
+# Why a separate event/callback instead of stuffing bytes into DownloadEvent:
+#   - DownloadEvent is JSON-serialized into the JSONL log and broadcast over
+#     WebSocket. Putting raw bytes there would either bloat the log or force
+#     a base64 round-trip nobody actually consumes.
+#   - The server.py path that needs the bytes (upload to R2 via JobBackend)
+#     is a distinct concern from "render an event in the UI". Keeping them
+#     split means the engine stays single-purpose and the consumer wires
+#     each hook to the subsystem that cares.
+#
+# Lifecycle: emitted ONCE per successful download, right after the bytes
+# have been verified (status=200, body starts with PK, optional fallback
+# already swapped in). Never emitted on block/fail — those produce only
+# a DownloadEvent.
+#
+# Failure mode: same as progress_callback — the scraper catches and
+# swallows callback exceptions so a bug in the consumer cannot abort an
+# otherwise healthy scraping job.
+
+
+@dataclass
+class FileSavedEvent:
+    """A ZIP that the engine just downloaded successfully.
+
+    Mirrors the metadata that DownloadEvent carries for the same CUFE so
+    the consumer can persist the file row without a cross-event join.
+    `body` is the raw ZIP — keep it small (DIAN ZIPs are ~80 KB average,
+    <1 MB worst case) so we never need to stream.
+    """
+
+    cufe: str
+    prefijo_folio: str
+    issuer_nit: str | None
+    issue_date: str | None
+    filename: str
+    body: bytes
+    size_bytes: int
+    sequence: int
+
+
+FileCallback = Callable[[FileSavedEvent], Awaitable[None]]
 
 
 # --------------------------------------------------------------------------
@@ -239,12 +288,28 @@ class DianTestScraper:
         downloads_dir: Path,
         logger: Logger,
         progress_callback: ProgressCallback | None = None,
+        file_callback: FileCallback | None = None,
+        write_to_disk: bool = True,
         headless: bool = True,
         delay_min_ms: int = HUMAN_DELAY_MIN_MS,
         delay_max_ms: int = HUMAN_DELAY_MAX_MS,
         long_pause_every: int = LONG_PAUSE_EVERY_N,
         cancel_event: asyncio.Event | None = None,
     ) -> None:
+        # Two new params (both opt-in, defaults preserve legacy behaviour):
+        #
+        #   file_callback — invoked once per successful ZIP download with
+        #   the raw bytes. server.py uses it to hand the file over to the
+        #   active JobBackend (filesystem or R2). When None, the engine
+        #   still writes to disk under `downloads_dir` so the CLI path
+        #   and any old caller keep working untouched.
+        #
+        #   write_to_disk — turn off the legacy `downloads_dir/{cufe}.zip`
+        #   write. Used when the consumer is responsible for persistence
+        #   (e.g. STORAGE_MODE=r2) so the container's filesystem doesn't
+        #   accumulate ZIPs we'd otherwise have to garbage-collect. The
+        #   default is True so behaviour is unchanged for anyone who
+        #   doesn't opt out explicitly.
         self.auth_url = auth_url
         self.start_date = start_date
         self.end_date = end_date
@@ -252,6 +317,8 @@ class DianTestScraper:
         self.downloads_dir = downloads_dir
         self.logger = logger
         self.progress_callback = progress_callback
+        self.file_callback = file_callback
+        self.write_to_disk = write_to_disk
         self.headless = headless
         self.delay_min_ms = delay_min_ms
         self.delay_max_ms = delay_max_ms
@@ -270,6 +337,23 @@ class DianTestScraper:
                 await self.progress_callback(event)
             except Exception:
                 pass
+
+    async def _emit_file(self, event: FileSavedEvent) -> None:
+        """Hand a freshly downloaded ZIP to the consumer.
+
+        Mirrors `_emit` semantics: callback errors are swallowed so a
+        misbehaving consumer cannot break an otherwise healthy scraping
+        run. The engine still has the event in `last_event`-equivalent
+        context and the DownloadEvent will be emitted right after, so
+        the operator can see something happened even if persistence
+        downstream silently failed.
+        """
+        if self.file_callback is None:
+            return
+        try:
+            await self.file_callback(event)
+        except Exception:
+            pass
 
     async def __aenter__(self) -> "DianTestScraper":
         self.pw = await async_playwright().start()
@@ -985,8 +1069,42 @@ class DianTestScraper:
                             fallback_note = f" (DownloadZipFiles fallback errored: {type(e).__name__})"
 
                     safe_id = invoice.cufe[:20] or f"seq-{sequence}"
-                    zip_path = self.downloads_dir / f"{safe_id}.zip"
-                    zip_path.write_bytes(body)
+                    filename = f"{safe_id}.zip"
+
+                    # Two persistence paths, picked by the caller:
+                    #
+                    # 1. write_to_disk=True (default, legacy): drop the
+                    #    ZIP under downloads_dir so the legacy /files
+                    #    endpoint can serve it and the CLI keeps its
+                    #    on-disk layout intact.
+                    #
+                    # 2. file_callback set (server-driven): hand the
+                    #    bytes to the consumer right here. server.py
+                    #    wires this to JobBackend.save_file which
+                    #    uploads to R2 in the postgres+R2 mode. When
+                    #    paired with write_to_disk=False this is the
+                    #    full "no local files" path the Fase 1 plan
+                    #    asks for.
+                    #
+                    # Both can be active at the same time (dual-write)
+                    # which is exactly what we want during the rollout:
+                    # disk for the legacy UI, R2 for NUVARA, no risk of
+                    # losing files if either side breaks.
+                    if self.write_to_disk:
+                        zip_path = self.downloads_dir / filename
+                        zip_path.write_bytes(body)
+                    await self._emit_file(
+                        FileSavedEvent(
+                            cufe=invoice.cufe,
+                            prefijo_folio=invoice.prefijo_folio,
+                            issuer_nit=invoice.issuer_nit,
+                            issue_date=invoice.issue_date,
+                            filename=filename,
+                            body=body,
+                            size_bytes=len(body),
+                            sequence=sequence,
+                        )
+                    )
 
                     # We intentionally DO NOT extract PDF/XML to disk
                     # here. The consumer (NUVARA) downloads only the
