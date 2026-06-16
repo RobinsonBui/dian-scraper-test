@@ -1031,7 +1031,52 @@ class DianTestScraper:
                         const dt = jq(tables[0]).DataTable();
                         const info = dt.page.info();
 
+                        // ── DOM fallback for serverSide DataTables ─────
+                        // Since 2026-06 DIAN uses a new serverSide
+                        // DataTable bound to /Document/GetDocumentsPageToken
+                        // that no longer populates dt.page.info().recordsTotal
+                        // when the first page is pre-rendered server-side.
+                        // We see rows in the <tbody> but the dt state stays
+                        // at recordsTotal=0. In that case fall back to
+                        // scraping the DOM directly — the rows ARE there,
+                        // just not visible to DataTables' state machine.
+                        const domRowsRaw = document.querySelectorAll(
+                            'table.dataTable tbody tr.document-row, '
+                            + 'table.dataTable tbody tr'
+                        );
+                        const domRows = [];
+                        domRowsRaw.forEach((node) => {
+                            const dataId = node.getAttribute('data-id') || '';
+                            const cells = [...node.querySelectorAll('td')].map(
+                                (c) => (c.innerText || c.textContent || '').trim()
+                            );
+                            if (cells.length === 0) return;
+                            // Skip rows that are clearly empty-state placeholders
+                            // (e.g. "No data available in table").
+                            if (cells.length === 1 && !dataId) return;
+                            domRows.push({ dataId, cells });
+                        });
+
                         if (info.recordsTotal === 0) {
+                            // Two sub-cases:
+                            //   (a) DataTables hasn't loaded its AJAX yet
+                            //       but the DOM has nothing → keep waiting
+                            //       (might be a real empty range OR a slow
+                            //       AJAX still in flight).
+                            //   (b) DataTables says zero but the DOM has
+                            //       rows → DIAN's new serverSide quirk.
+                            //       Trust the DOM.
+                            if (domRows.length > 0) {
+                                resolve(JSON.stringify({
+                                    ok: true,
+                                    method: 'dom-fallback-serverside',
+                                    recordsTotal: domRows.length,
+                                    rows: domRows.slice(0, maxInvoices || domRows.length),
+                                    pages: 1,
+                                    warning: 'DataTables.recordsTotal=0 but DOM had rows',
+                                }));
+                                return;
+                            }
                             if (elapsed >= maxWaitMs) {
                                 resolve(JSON.stringify({
                                     ok: true,
@@ -1121,12 +1166,36 @@ class DianTestScraper:
                     notes=f"hint: {result.get('hint', '')}",
                 )
             )
+            # Capture the page so we can see why DIAN's HTML didn't
+            # match our DataTables expectations. Same channel as the
+            # auth diagnostics — operator opens GET /files/{job_id}/
+            # listing-failed.png to triage.
+            try:
+                await self._snapshot_for_diagnostics(
+                    tag="listing-failed",
+                    landed_url=self.page.url if self.page else "",
+                )
+            except Exception:
+                pass
             return []
 
         rows_data = result.get("rows", [])
         records_total = result.get("recordsTotal", 0)
         method = result.get("method", "")
         pages = result.get("pages", 1)
+
+        # Edge case: result.ok is True but we got zero rows AND DIAN
+        # reports recordsTotal=0. Could be a legitimately empty range,
+        # could be the same serverSide bug from a different angle.
+        # Snapshot the page so the operator can decide.
+        if records_total == 0 and not rows_data:
+            try:
+                await self._snapshot_for_diagnostics(
+                    tag="listing-empty",
+                    landed_url=self.page.url if self.page else "",
+                )
+            except Exception:
+                pass
 
         invoices: list[InvoiceRow] = []
         for i, row in enumerate(rows_data):
