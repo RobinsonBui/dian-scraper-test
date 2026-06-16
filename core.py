@@ -877,272 +877,193 @@ class DianTestScraper:
 
         await asyncio.sleep(2)
 
-        # DIAN renders the listing via jQuery DataTables with server-side
-        # AJAX pagination. The DOM only contains the rows of the CURRENT
-        # page (default pageLength=10), so a naive querySelectorAll only
-        # returns the first 10 rows.
+        # DOM-pure listing — no dependency on the page's jQuery/DataTables.
         #
-        # Strategy (mirrors Nuvara's dian_invoice_scraper.py:88-267):
-        #   1. Wait for DataTables to be ready.
-        #   2. If recordsTotal <= length → all on one page.
-        #   3. Otherwise: set page.len(100), then iterate dt.page(n).draw()
-        #      using the draw.dt event to wait for each AJAX response.
-        #   4. Concat all rows across pages.
+        # Why: Camoufox sandboxes Playwright's page.evaluate() so it runs
+        # in an isolated world that CANNOT see the page's `window.jQuery`,
+        # `$`, or the live DataTable instance. The previous strategy
+        # (waitForDT + dt.page.info() + dt.page(n).draw()) timed out
+        # after 120 s every single time on Camoufox because `jQuery`
+        # was undefined in evaluate's scope — even though the page
+        # had it loaded.
+        #
+        # New strategy (Camoufox + Chromium friendly):
+        #   1. Poll the DOM for `table.dataTable tbody tr.document-row`.
+        #      DIAN pre-renders page 1 server-side, so as soon as the
+        #      tbody has rows we can read them with no JS injection.
+        #   2. For pagination, scrape the visible page, then click the
+        #      DataTables 'Next' button via `.click()` (DOM-only,
+        #      works in both engines). After the click, poll the
+        #      tbody until the data-id of the first row changes — that's
+        #      how we know the new page rendered.
+        #   3. Stop on: no Next button (or it's disabled), or
+        #      maxInvoices reached, or the budget runs out.
         result_json = await self.page.evaluate(
             """({ maxWaitMs, intervalMs, maxInvoices }) => new Promise((resolve) => {
-                let elapsed = 0;
-                const getJQ = () => {
-                    if (typeof jQuery !== 'undefined') return jQuery;
-                    if (typeof $ !== 'undefined' && $.fn) return $;
-                    return null;
-                };
+                const startedAt = Date.now();
+                const deadline = startedAt + maxWaitMs;
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-                const collectAllRows = (dt) => {
-                    // dt.rows().data() returns the raw row data from the
-                    // ajax payload (array per row). We also want the DOM
-                    // node so we can read data-id and cell text reliably.
+                const TABLE_SELECTOR = 'table.dataTable, table#tableDocuments';
+                const ROW_SELECTOR = 'tbody tr.document-row, tbody tr[data-id]';
+
+                const getTable = () => document.querySelector(TABLE_SELECTOR);
+
+                const readCurrentPageRows = () => {
+                    const table = getTable();
+                    if (!table) return [];
                     const out = [];
-                    dt.rows().every(function (rowIdx) {
-                        const node = this.node();
-                        if (!node) return;
+                    table.querySelectorAll(ROW_SELECTOR).forEach((node) => {
                         const dataId = node.getAttribute('data-id') || '';
                         const cells = [...node.querySelectorAll('td')].map(
                             (c) => (c.innerText || c.textContent || '').trim()
                         );
                         if (cells.length === 0) return;
+                        // Skip empty-state placeholder rows
+                        // ('No se encontraron resultados', etc.)
+                        if (cells.length === 1 && !dataId) return;
                         out.push({ dataId, cells });
-                        if (maxInvoices > 0 && out.length >= maxInvoices) {
-                            return false; // break
-                        }
                     });
                     return out;
                 };
 
-                const startPagination = (dt, info, remaining) => {
-                    const pageSize = info.length || 100;
-                    const totalPages = Math.ceil(info.recordsTotal / pageSize);
-                    let allRows = collectAllRows(dt);
-                    let done = false;
-
-                    if (totalPages <= 1 || (maxInvoices > 0 && allRows.length >= maxInvoices)) {
-                        resolve(JSON.stringify({
-                            ok: true,
-                            method: 'single-page-rows',
-                            recordsTotal: info.recordsTotal,
-                            rows: allRows.slice(0, maxInvoices || allRows.length),
-                            pages: 1,
-                        }));
-                        return;
+                const findNextButton = () => {
+                    // DataTables' Next button changes class set across
+                    // versions; we accept any of the known shapes:
+                    //   - <button class="dt-paging-button ... next">
+                    //   - <a class="paginate_button next">
+                    // We exclude disabled buttons so we don't click into
+                    // a non-existent next page.
+                    const selectors = [
+                        '.dt-paging button.next:not(.disabled):not([aria-disabled="true"])',
+                        'a.paginate_button.next:not(.disabled)',
+                        '.dt-paging button[aria-label="Next"]:not(.disabled):not([aria-disabled="true"])',
+                        'button.dt-paging-button[data-dt-idx="next"]:not(.disabled):not([aria-disabled="true"])',
+                    ];
+                    for (const sel of selectors) {
+                        const btn = document.querySelector(sel);
+                        if (btn) return btn;
                     }
-
-                    let nextPage = 1;
-                    const safety = setTimeout(() => {
-                        if (done) return;
-                        done = true;
-                        resolve(JSON.stringify({
-                            ok: true,
-                            method: 'pagination-timeout',
-                            warning: 'safety timer fired',
-                            recordsTotal: info.recordsTotal,
-                            rows: allRows.slice(0, maxInvoices || allRows.length),
-                            pages: nextPage,
-                            totalPages,
-                        }));
-                    }, Math.max(remaining, 60000));
-
-                    const collectNext = () => {
-                        dt.one('draw.dt', () => {
-                            if (done) return;
-                            const pageRows = collectAllRows(dt);
-                            // collectAllRows reads from CURRENT page only when
-                            // using `.rows({page:'current'})`. With `.rows()`
-                            // it returns everything DT has buffered which may
-                            // re-include earlier pages — to be safe we use
-                            // the DOM-restricted version below.
-                            const tbody = document.querySelectorAll(
-                                'table.dataTable tbody tr'
-                            );
-                            const onlyThisPage = [];
-                            tbody.forEach((node) => {
-                                const dataId = node.getAttribute('data-id') || '';
-                                const cells = [...node.querySelectorAll('td')].map(
-                                    (c) => (c.innerText || c.textContent || '').trim()
-                                );
-                                if (cells.length === 0) return;
-                                onlyThisPage.push({ dataId, cells });
-                            });
-                            allRows = allRows.concat(onlyThisPage);
-                            nextPage++;
-                            const reachedCap =
-                                maxInvoices > 0 && allRows.length >= maxInvoices;
-                            if (nextPage < totalPages && !reachedCap) {
-                                collectNext();
-                            } else {
-                                done = true;
-                                clearTimeout(safety);
-                                resolve(JSON.stringify({
-                                    ok: true,
-                                    method: 'pagination',
-                                    recordsTotal: info.recordsTotal,
-                                    rows: allRows.slice(0, maxInvoices || allRows.length),
-                                    pages: nextPage,
-                                    totalPages,
-                                }));
-                            }
-                        });
-                        dt.page(nextPage).draw(false);
-                    };
-
-                    // First page is already collected via collectAllRows above.
-                    collectNext();
+                    return null;
                 };
 
-                const waitForDT = () => {
-                    const jq = getJQ();
-                    if (!jq || !jq.fn || !jq.fn.dataTable) {
-                        if (elapsed >= maxWaitMs) {
-                            resolve(JSON.stringify({
-                                ok: false,
-                                error: 'timeout-no-jquery-or-datatables',
-                                hint: 'DIAN may not be using jQuery DataTables on this page',
-                            }));
-                            return;
+                const waitForFirstRows = async () => {
+                    // Poll up to maxWaitMs/2 for the tbody to be
+                    // populated. We split the budget so a slow page-1
+                    // load still leaves room to walk pagination.
+                    const tableDeadline = Math.min(
+                        Date.now() + Math.floor(maxWaitMs / 2),
+                        deadline
+                    );
+                    while (Date.now() < tableDeadline) {
+                        const rows = readCurrentPageRows();
+                        if (rows.length > 0) return rows;
+                        // Bail if we're at deadline OR if the table
+                        // exists and explicitly says 'no results' so
+                        // we don't waste the rest of the budget.
+                        const table = getTable();
+                        if (table) {
+                            const txt = (table.innerText || '').toLowerCase();
+                            if (
+                                txt.includes('ningún documento disponible')
+                                || txt.includes('no se encontraron resultados')
+                            ) {
+                                return [];
+                            }
                         }
-                        elapsed += intervalMs;
-                        setTimeout(waitForDT, intervalMs);
+                        await sleep(intervalMs);
+                    }
+                    return readCurrentPageRows();
+                };
+
+                const waitForPageChange = async (prevSignature) => {
+                    // After clicking Next we wait for either:
+                    //   - the first row's data-id to differ from before, or
+                    //   - the row count to change, or
+                    //   - we hit the deadline.
+                    while (Date.now() < deadline) {
+                        const rows = readCurrentPageRows();
+                        const sig = rows.length === 0
+                            ? `EMPTY:${rows.length}`
+                            : `${rows[0].dataId}|${rows.length}`;
+                        if (sig !== prevSignature && rows.length > 0) {
+                            return rows;
+                        }
+                        await sleep(intervalMs);
+                    }
+                    return readCurrentPageRows();
+                };
+
+                (async () => {
+                    let allRows = await waitForFirstRows();
+
+                    if (allRows.length === 0) {
+                        resolve(JSON.stringify({
+                            ok: true,
+                            method: 'dom-zero-records',
+                            recordsTotal: 0,
+                            rows: [],
+                            pages: 0,
+                        }));
                         return;
                     }
 
-                    try {
-                        const tables = jq.fn.dataTable.tables();
-                        if (!tables || tables.length === 0) {
-                            if (elapsed >= maxWaitMs) {
-                                resolve(JSON.stringify({
-                                    ok: false,
-                                    error: 'no-datatable-instance',
-                                }));
-                                return;
-                            }
-                            elapsed += intervalMs;
-                            setTimeout(waitForDT, intervalMs);
-                            return;
+                    let pageCount = 1;
+                    while (Date.now() < deadline) {
+                        if (maxInvoices > 0 && allRows.length >= maxInvoices) break;
+                        const next = findNextButton();
+                        if (!next) break;
+                        const prevSig =
+                            `${allRows[allRows.length - 1].dataId}|first`;
+                        // Click the button. We deliberately use the DOM
+                        // click() because dispatching a synthetic event
+                        // would skip jQuery handlers DataTables wires up.
+                        try {
+                            next.click();
+                        } catch (e) {
+                            // If clicking fails (button gone, etc.) we
+                            // just stop pagination — what we have is
+                            // already a valid result.
+                            break;
                         }
-
-                        const dt = jq(tables[0]).DataTable();
-                        const info = dt.page.info();
-
-                        // ── DOM fallback for serverSide DataTables ─────
-                        // Since 2026-06 DIAN uses a new serverSide
-                        // DataTable bound to /Document/GetDocumentsPageToken
-                        // that no longer populates dt.page.info().recordsTotal
-                        // when the first page is pre-rendered server-side.
-                        // We see rows in the <tbody> but the dt state stays
-                        // at recordsTotal=0. In that case fall back to
-                        // scraping the DOM directly — the rows ARE there,
-                        // just not visible to DataTables' state machine.
-                        const domRowsRaw = document.querySelectorAll(
-                            'table.dataTable tbody tr.document-row, '
-                            + 'table.dataTable tbody tr'
+                        // After clicking, the current page rows are still
+                        // showing for a tick. Wait for change.
+                        const pageRows = await waitForPageChange(prevSig);
+                        if (pageRows.length === 0) break;
+                        const seenIds = new Set(
+                            allRows.map((r) => r.dataId).filter(Boolean)
                         );
-                        const domRows = [];
-                        domRowsRaw.forEach((node) => {
-                            const dataId = node.getAttribute('data-id') || '';
-                            const cells = [...node.querySelectorAll('td')].map(
-                                (c) => (c.innerText || c.textContent || '').trim()
-                            );
-                            if (cells.length === 0) return;
-                            // Skip rows that are clearly empty-state placeholders
-                            // (e.g. "No data available in table").
-                            if (cells.length === 1 && !dataId) return;
-                            domRows.push({ dataId, cells });
-                        });
-
-                        if (info.recordsTotal === 0) {
-                            // Two sub-cases:
-                            //   (a) DataTables hasn't loaded its AJAX yet
-                            //       but the DOM has nothing → keep waiting
-                            //       (might be a real empty range OR a slow
-                            //       AJAX still in flight).
-                            //   (b) DataTables says zero but the DOM has
-                            //       rows → DIAN's new serverSide quirk.
-                            //       Trust the DOM.
-                            if (domRows.length > 0) {
-                                resolve(JSON.stringify({
-                                    ok: true,
-                                    method: 'dom-fallback-serverside',
-                                    recordsTotal: domRows.length,
-                                    rows: domRows.slice(0, maxInvoices || domRows.length),
-                                    pages: 1,
-                                    warning: 'DataTables.recordsTotal=0 but DOM had rows',
-                                }));
-                                return;
+                        let added = 0;
+                        for (const r of pageRows) {
+                            if (r.dataId && seenIds.has(r.dataId)) continue;
+                            allRows.push(r);
+                            added++;
+                            if (maxInvoices > 0 && allRows.length >= maxInvoices) {
+                                break;
                             }
-                            if (elapsed >= maxWaitMs) {
-                                resolve(JSON.stringify({
-                                    ok: true,
-                                    method: 'zero-records',
-                                    recordsTotal: 0,
-                                    rows: [],
-                                }));
-                                return;
-                            }
-                            elapsed += intervalMs;
-                            setTimeout(waitForDT, intervalMs);
-                            return;
                         }
-
-                        if (info.recordsTotal <= info.length) {
-                            // All records fit on one page
-                            const rows = collectAllRows(dt);
-                            resolve(JSON.stringify({
-                                ok: true,
-                                method: 'single-page',
-                                recordsTotal: info.recordsTotal,
-                                rows: rows.slice(0, maxInvoices || rows.length),
-                                pages: 1,
-                            }));
-                            return;
-                        }
-
-                        // Bump page size to 100 (DIAN max) to reduce rounds
-                        if (info.length < 100) {
-                            dt.one('draw.dt', () => {
-                                const newInfo = dt.page.info();
-                                if (newInfo.recordsTotal <= newInfo.length) {
-                                    const rows = collectAllRows(dt);
-                                    resolve(JSON.stringify({
-                                        ok: true,
-                                        method: 'single-page-after-resize',
-                                        recordsTotal: newInfo.recordsTotal,
-                                        rows: rows.slice(0, maxInvoices || rows.length),
-                                        pages: 1,
-                                    }));
-                                } else {
-                                    startPagination(dt, newInfo, maxWaitMs - elapsed);
-                                }
-                            });
-                            dt.page.len(100).draw();
-                            return;
-                        }
-
-                        startPagination(dt, info, maxWaitMs - elapsed);
-                    } catch (err) {
-                        if (elapsed >= maxWaitMs) {
-                            resolve(JSON.stringify({
-                                ok: false,
-                                error: 'datatables-error: ' + err.message,
-                            }));
-                            return;
-                        }
-                        elapsed += intervalMs;
-                        setTimeout(waitForDT, intervalMs);
+                        pageCount++;
+                        // If we didn't add anything new (e.g. page didn't
+                        // actually change) bail to avoid infinite loops.
+                        if (added === 0) break;
                     }
-                };
 
-                waitForDT();
+                    resolve(JSON.stringify({
+                        ok: true,
+                        method: pageCount > 1 ? 'dom-pagination' : 'dom-single-page',
+                        recordsTotal: allRows.length,
+                        rows: allRows.slice(0, maxInvoices || allRows.length),
+                        pages: pageCount,
+                    }));
+                })().catch((err) => {
+                    resolve(JSON.stringify({
+                        ok: false,
+                        error: 'dom-strategy-failed: ' + (err && err.message),
+                    }));
+                });
             })""",
             {
-                "maxWaitMs": 120000,
+                "maxWaitMs": 60000,
                 "intervalMs": 500,
                 "maxInvoices": self.max_invoices,
             },
