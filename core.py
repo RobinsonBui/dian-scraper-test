@@ -80,6 +80,11 @@ def _env_float(name: str, default: float) -> float:
 
 DIAN_BASE_URL = "https://catalogo-vpfe.dian.gov.co"
 RECEIVED_URL = f"{DIAN_BASE_URL}/Document/Received"
+# DIAN files emitted invoices under /Document/Sent. The DataTables
+# form is identical to /Received, which is why the rest of the engine
+# is direction-agnostic — we just navigate to a different URL up
+# front. NUVARA's main scraper (apps/causation) uses the same pair.
+SENT_URL = f"{DIAN_BASE_URL}/Document/Sent"
 GETFILE_PDF_URL = f"{DIAN_BASE_URL}/Document/GetFilePdf"
 DOWNLOAD_ZIP_URL = f"{DIAN_BASE_URL}/Document/DownloadZipFiles"
 
@@ -356,6 +361,7 @@ class DianTestScraper:
         long_pause_every: int = LONG_PAUSE_EVERY_N,
         cancel_event: asyncio.Event | None = None,
         skip_cufes: list[str] | set[str] | None = None,
+        direction: str = "purchase",
     ) -> None:
         # Two new params (both opt-in, defaults preserve legacy behaviour):
         #
@@ -395,6 +401,17 @@ class DianTestScraper:
             if skip_cufes
             else set()
         )
+        # Which DIAN bucket to scrape. We validate up-front so a typo
+        # ('Purchase', 'compras', 'received') doesn't silently fall
+        # back to the default and confuse the operator. The list URL
+        # is decided here so the rest of the engine only touches
+        # `self.list_url`.
+        if direction not in ("purchase", "sale"):
+            raise ValueError(
+                f"direction must be 'purchase' or 'sale', got {direction!r}"
+            )
+        self.direction: str = direction
+        self.list_url: str = SENT_URL if direction == "sale" else RECEIVED_URL
 
         self.pw: Playwright | None = None
         self.browser: Browser | None = None
@@ -854,7 +871,7 @@ class DianTestScraper:
                 status="info",
                 notes=(
                     f"Listing invoices {self.start_date}..{self.end_date} "
-                    f"(max {self.max_invoices})..."
+                    f"direction={self.direction} (max {self.max_invoices})..."
                 ),
             )
         )
@@ -867,14 +884,14 @@ class DianTestScraper:
         # (e.g. portal has a long-polling XHR open).
         try:
             await self.page.goto(
-                RECEIVED_URL, wait_until="networkidle", timeout=60000
+                self.list_url, wait_until="networkidle", timeout=60000
             )
         except Exception:
             # networkidle can hang on long-polling endpoints; fall back
             # to the previous behaviour and let waitForDT below absorb
             # the remaining script load time.
             await self.page.goto(
-                RECEIVED_URL, wait_until="domcontentloaded", timeout=120000
+                self.list_url, wait_until="domcontentloaded", timeout=120000
             )
         await asyncio.sleep(2)
 
@@ -1700,7 +1717,10 @@ class DianTestScraper:
             url,
             headers={
                 "Accept": "application/octet-stream, application/zip, */*",
-                "Referer": RECEIVED_URL,
+                # Referer matches the bucket we navigated to. DIAN
+                # validates this on download endpoints — using the
+                # wrong one yields a 403 on sale runs.
+                "Referer": self.list_url,
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "cors",
                 "Sec-Fetch-Site": "same-origin",

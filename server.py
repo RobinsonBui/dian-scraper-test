@@ -36,7 +36,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Awaitable, Optional
+from typing import Any, Callable, Awaitable, Literal, Optional
 
 import uvicorn
 from fastapi import (
@@ -403,6 +403,17 @@ class StartRequest(BaseModel):
     # behaviour an operator gets when driving the scraper from the
     # standalone UI without a NUVARA-side lookup.
     skip_cufes: Optional[list[str]] = None
+    # Which DIAN bucket to scrape:
+    #   - "purchase" → /Document/Received (compras, default).
+    #   - "sale"     → /Document/Sent (ventas).
+    # Default 'purchase' keeps old NUVARA images that don't send the
+    # field working as before. The standalone UI of this scraper
+    # always uses the default — it's M2M / NUVARA that flips it.
+    #
+    # The 'support' / Documento Soporte case from NUVARA's main sync
+    # is intentionally NOT modeled here; that needs a dual-bucket
+    # query plan we don't implement on this rail yet.
+    direction: Literal["purchase", "sale"] = "purchase"
 
 
 # --------------------------------------------------------------------------
@@ -883,6 +894,12 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
                 # filters them out at listing time so the per-CUFE
                 # download loop never sees them.
                 skip_cufes=req.skip_cufes,
+                # Which DIAN bucket to navigate to. core uses
+                # /Document/Received for 'purchase' (default) and
+                # /Document/Sent for 'sale'. The DataTables form
+                # layout is identical on both, so the rest of the
+                # engine is direction-agnostic.
+                direction=req.direction,
                 cancel_event=cancel_event,
             ) as scraper:
                 summary = await scraper.run()
