@@ -366,19 +366,36 @@ class DianTestScraper:
     async def _emit_file(self, event: FileSavedEvent) -> None:
         """Hand a freshly downloaded ZIP to the consumer.
 
-        Mirrors `_emit` semantics: callback errors are swallowed so a
+        Mirrors `_emit` semantics: callback errors are caught so a
         misbehaving consumer cannot break an otherwise healthy scraping
-        run. The engine still has the event in `last_event`-equivalent
-        context and the DownloadEvent will be emitted right after, so
-        the operator can see something happened even if persistence
-        downstream silently failed.
+        run. We DO surface the failure in the live event log though —
+        the previous version swallowed exceptions silently and a
+        regression in the server's on_file_saved (an HTTPException
+        leaking from a date parser) left the operator with a job
+        that downloaded 10 ZIPs successfully but reported files: [].
+        Better to broadcast the symptom than to hide it.
         """
         if self.file_callback is None:
             return
         try:
             await self.file_callback(event)
-        except Exception:
-            pass
+        except Exception as e:
+            await self._emit(
+                DownloadEvent(
+                    timestamp=datetime.utcnow().isoformat(),
+                    sequence=event.sequence,
+                    cufe=event.cufe,
+                    prefijo_folio=event.prefijo_folio,
+                    phase="persist",
+                    status="fail",
+                    error=f"{type(e).__name__}: {e}",
+                    notes=(
+                        f"file_callback raised while persisting "
+                        f"{event.filename}; the ZIP will NOT appear in "
+                        f"GET /api/jobs/{{id}}.files[]"
+                    ),
+                )
+            )
 
     async def _snapshot_for_diagnostics(
         self, *, tag: str, landed_url: str,

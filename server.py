@@ -323,6 +323,45 @@ def _parse_iso_date(value: str) -> date:
         raise HTTPException(400, f"invalid date '{value}': {e}")
 
 
+def _parse_dian_date(value: str | None) -> date | None:
+    """Parse a date string emitted by the DIAN scraper.
+
+    Two accepted shapes, in order:
+
+      * ISO YYYY-MM-DD          when the engine already normalised it.
+      * DIAN DD-MM-YYYY         the raw format DIAN's portal returns
+                                 in the document listing (e.g. '08-06-2026').
+
+    Returns None on empty/whitespace input or anything we can't parse,
+    instead of raising. This is critical: the caller (on_file_saved)
+    persists the file regardless of whether the date can be parsed;
+    a bad date should NOT silently drop the entire file row, which is
+    exactly what was happening before (HTTPException leaking into
+    _emit_file's try/except).
+    """
+    if value is None:
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        pass
+    # DIAN's dd-mm-yyyy with dashes (or sometimes slashes)
+    for sep in ("-", "/"):
+        parts = s.split(sep)
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            try:
+                d, m, y = (int(p) for p in parts)
+                if y < 100:
+                    y += 2000
+                return date(y, m, d)
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
 # --------------------------------------------------------------------------
 # Request / Response models
 # --------------------------------------------------------------------------
@@ -713,19 +752,44 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
         )
 
     async def on_file_saved(event: FileSavedEvent) -> None:
-        """file_callback → backend.save_file (filesystem OR R2 upload)."""
-        issue_date = _parse_iso_date(event.issue_date) if event.issue_date else None
-        await backend.save_file(
-            job_id=job_id,
-            company_id=req.company_id,
-            cufe=event.cufe or None,
-            prefijo_folio=event.prefijo_folio or None,
-            issuer_nit=event.issuer_nit or None,
-            issue_date=issue_date,
-            filename=event.filename,
-            body=event.body,
-            kind="zip",
-        )
+        """file_callback → backend.save_file (filesystem OR R2 upload).
+
+        Errors raised here are caught by core._emit_file and would
+        otherwise vanish silently. We explicitly log them so a future
+        regression doesn't leave the operator staring at files: []
+        without a clue why.
+
+        The old version called _parse_iso_date which raises
+        HTTPException on bad input. DIAN's listing returns dates as
+        DD-MM-YYYY (e.g. '08-06-2026'), not ISO, so EVERY successful
+        download was hitting that and the exception was being
+        swallowed by core._emit_file. _parse_dian_date tolerates
+        both shapes and falls back to None — the file row still
+        lands, just without the issue_date field populated.
+        """
+        try:
+            issue_date = _parse_dian_date(event.issue_date)
+            await backend.save_file(
+                job_id=job_id,
+                company_id=req.company_id,
+                cufe=event.cufe or None,
+                prefijo_folio=event.prefijo_folio or None,
+                issuer_nit=event.issuer_nit or None,
+                issue_date=issue_date,
+                filename=event.filename,
+                body=event.body,
+                kind="zip",
+            )
+        except Exception:
+            logger.exception(
+                "on_file_saved failed for job=%s file=%s — file will not "
+                "appear in /api/jobs/{id}.files[]",
+                job_id, event.filename,
+            )
+            # Re-raise so callers higher up can react. core._emit_file
+            # still swallows it (its contract is best-effort) but the
+            # log line above is what the operator needs.
+            raise
 
     async def heartbeat_loop() -> None:
         """Bump worker_heartbeat every WORKER_HEARTBEAT_SECONDS.
