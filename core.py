@@ -329,6 +329,12 @@ class DianTestScraper:
         self.browser: Browser | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
+        # Populated by __aenter__: 'chromium' or 'camoufox'. Kept on
+        # the instance for diagnostics / logging downstream.
+        self.browser_engine: str = "chromium"
+        # AsyncCamoufox context manager — only set when
+        # BROWSER_ENGINE=camoufox. __aexit__ tears it down.
+        self._camoufox_ctx: Any = None
 
     async def _emit(self, event: DownloadEvent) -> None:
         self.logger.emit(event)
@@ -475,18 +481,34 @@ class DianTestScraper:
                 )
 
     async def __aenter__(self) -> "DianTestScraper":
-        self.pw = await async_playwright().start()
+        # Browser engine selection. Default stays `chromium` to keep the
+        # legacy boot path zero-change for anyone who hasn't flipped the
+        # env var, but `camoufox` is the recommended setting for DIAN
+        # given Azure WAF's increasingly strict bot detection. The
+        # causation rail in NUVARA already uses Camoufox for the same
+        # reason — this brings the standalone scraper into parity.
+        engine = os.environ.get("BROWSER_ENGINE", "chromium").strip().lower()
+        if engine not in {"chromium", "camoufox"}:
+            engine = "chromium"
+        self.browser_engine = engine
 
         # Optional proxy via env var (e.g. exit-node in Colombia so DIAN
         # responds fast / doesn't geo-throttle our BR-hosted server).
         proxy_cfg = _parse_proxy_url(os.environ.get("PROXY_URL"))
 
-        launch_kwargs: dict[str, Any] = {
-            "headless": self.headless,
-            "args": ["--disable-blink-features=AutomationControlled"],
-        }
+        await self._emit(
+            DownloadEvent(
+                timestamp=datetime.utcnow().isoformat(),
+                sequence=0,
+                cufe="",
+                prefijo_folio="",
+                phase="log",
+                status="info",
+                notes=f"Browser engine: {engine}",
+            )
+        )
+
         if proxy_cfg:
-            launch_kwargs["proxy"] = proxy_cfg
             await self._emit(
                 DownloadEvent(
                     timestamp=datetime.utcnow().isoformat(),
@@ -500,6 +522,23 @@ class DianTestScraper:
                 )
             )
 
+        if engine == "camoufox":
+            await self._launch_camoufox(proxy_cfg)
+        else:
+            await self._launch_chromium(proxy_cfg)
+        return self
+
+    async def _launch_chromium(
+        self, proxy_cfg: dict[str, str] | None,
+    ) -> None:
+        """Original Chromium path. Kept for parity / debugging."""
+        self.pw = await async_playwright().start()
+        launch_kwargs: dict[str, Any] = {
+            "headless": self.headless,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        if proxy_cfg:
+            launch_kwargs["proxy"] = proxy_cfg
         self.browser = await self.pw.chromium.launch(**launch_kwargs)
         self.context = await self.browser.new_context(
             user_agent=USER_AGENT,
@@ -514,15 +553,84 @@ class DianTestScraper:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         self.page = await self.context.new_page()
-        return self
+
+    async def _launch_camoufox(
+        self, proxy_cfg: dict[str, str] | None,
+    ) -> None:
+        """Camoufox path — Firefox-based anti-detect browser.
+
+        Mirrors the kwargs that NUVARA's causation rail already uses
+        successfully against DIAN (apps/causation config.py:503). The
+        firefox_user_prefs disable GPU/IPC features that crash inside
+        Docker containers without /dev/shm or a real GPU. Camoufox is
+        imported lazily so the default chromium path doesn't pay the
+        cost of loading the binary bundle.
+        """
+        # Lazy import — we don't want chromium-only deployments paying
+        # the import cost (camoufox pulls a few MB of dependencies).
+        from camoufox.async_api import AsyncCamoufox  # noqa: PLC0415
+        from camoufox.addons import DefaultAddons  # noqa: PLC0415
+
+        kwargs: dict[str, Any] = {
+            "headless": self.headless,
+            "block_webgl": True,
+            "exclude_addons": [DefaultAddons.UBO],
+            "i_know_what_im_doing": True,
+            "firefox_user_prefs": {
+                # No GPU/rendering acceleration inside a container.
+                "gfx.webrender.all": False,
+                "gfx.webrender.enabled": False,
+                "layers.acceleration.disabled": True,
+                "gfx.canvas.accelerated": False,
+                "gfx.x11-egl.force-disabled": True,
+                # Single-process to avoid IPC crashes on small /dev/shm.
+                "browser.tabs.remote.autostart": False,
+                "dom.ipc.processCount": 0,
+            },
+            # Locale + timezone via Camoufox so the fingerprint stays
+            # internally consistent (UA, navigator.language, Intl, etc.).
+            "locale": "es-CO",
+            "geoip": True,
+        }
+        if proxy_cfg:
+            kwargs["proxy"] = proxy_cfg
+
+        self._camoufox_ctx = AsyncCamoufox(**kwargs)
+        self.browser = await self._camoufox_ctx.__aenter__()
+        # Camoufox already injects locale + UA at the engine level, so
+        # we deliberately skip the new_context() override we use for
+        # chromium — overriding here would create the kind of
+        # internally inconsistent fingerprint Camoufox is meant to
+        # avoid (e.g. UA says Firefox but navigator.userAgentData
+        # still leaks Chromium hints).
+        self.context = await self.browser.new_context()
+        self.page = await self.context.new_page()
 
     async def __aexit__(self, *args: Any) -> None:
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-        if self.pw:
-            await self.pw.stop()
+        try:
+            if self.context:
+                await self.context.close()
+        except Exception:
+            pass
+        try:
+            if self.browser:
+                await self.browser.close()
+        except Exception:
+            pass
+        # Tear down whichever engine driver we used. Both paths are
+        # best-effort — failures during shutdown shouldn't mask the
+        # original error that may have triggered the exit.
+        try:
+            if self.pw:
+                await self.pw.stop()
+        except Exception:
+            pass
+        try:
+            ctx = getattr(self, "_camoufox_ctx", None)
+            if ctx is not None:
+                await ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
 
     async def authenticate(self) -> None:
         assert self.page is not None

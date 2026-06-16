@@ -82,6 +82,21 @@ services:
       - DEFAULT_DELAY_MIN_MS=${DEFAULT_DELAY_MIN_MS:-1000}
       - DEFAULT_DELAY_MAX_MS=${DEFAULT_DELAY_MAX_MS:-6000}
       - DEFAULT_LONG_PAUSE_EVERY=${DEFAULT_LONG_PAUSE_EVERY:-30}
+      # Browser engine for the Playwright session.
+      #
+      #   chromium → upstream Playwright chromium (default for backwards
+      #              compat). Increasingly flagged by DIAN's Azure WAF
+      #              JS challenge.
+      #   camoufox → Firefox-based anti-detect build. Same engine the
+      #              NUVARA causation rail uses successfully against
+      #              DIAN. Required when WAF starts returning the
+      #              'Un momento, estamos comprobando que no sea un
+      #              bot' interstitial.
+      #
+      # The image fetches the Camoufox binary at build time so the
+      # only thing this flag does at runtime is choose which launch
+      # path runs. No restart cost.
+      - BROWSER_ENGINE=${BROWSER_ENGINE:-chromium}
       # ──────────────────────────────────────────────────────────────
       # Storage / state backends — feature-flagged so we can deploy
       # this code without breaking the in-memory legacy path.

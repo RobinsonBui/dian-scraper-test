@@ -4,6 +4,13 @@ click>=8.1.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 
+# Anti-detect Firefox browser (used when BROWSER_ENGINE=camoufox).
+# Required to pass DIAN's Azure WAF JS challenge that Chromium gets
+# flagged by; the causation rail in NUVARA already relies on it for
+# the same reason. The geoip extra ships the MaxMind DB used to keep
+# timezone / locale spoofing consistent with the proxy's exit IP.
+camoufox[geoip]>=0.4.0
+
 # Postgres driver — used only when DB_MODE=postgres. Pinned so the
 # build is reproducible across deploys. asyncpg is async-native and
 # much faster than psycopg under the FastAPI event loop.

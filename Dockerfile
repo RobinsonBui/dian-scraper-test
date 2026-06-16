@@ -17,6 +17,20 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Fetch the Camoufox Firefox build + the geoip database. Done here so
+# the image is self-contained — at runtime the scraper just imports
+# camoufox and finds the binary in place. The fetch downloads about
+# 200 MB so it lives in its own layer to maximise cache reuse.
+#
+# We tolerate failure with `|| true` to keep the image buildable
+# in environments without internet access at build time (e.g. some
+# CI sandboxes). When BROWSER_ENGINE=camoufox the launch will fail
+# loudly at runtime if the binary wasn't fetched, which is the
+# desired feedback loop. Default BROWSER_ENGINE stays `chromium`
+# so a fetch failure doesn't break legacy deploys.
+RUN python -m camoufox fetch 2>&1 | tail -20 || true
+RUN python -m camoufox fetch --geoip 2>&1 | tail -20 || true
+
 # App code. Each Python module is listed explicitly so the image
 # doesn't accidentally pick up local dev artefacts (downloads/,
 # logs/, __pycache__, .env, …). When adding a new module remember
