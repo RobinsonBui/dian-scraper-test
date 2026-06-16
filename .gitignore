@@ -24,3 +24,4 @@ Thumbs.db
 *.tar
 *.tar.gz
 _smoke_test.py
+_fake_dian.py
