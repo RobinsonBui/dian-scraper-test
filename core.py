@@ -1094,6 +1094,13 @@ class DianTestScraper:
                     const out = [];
                     table.querySelectorAll(ROW_SELECTOR).forEach((node) => {
                         const dataId = node.getAttribute('data-id') || '';
+                        // dataType is DIAN's numeric document type code
+                        // (e.g. '01' Factura, '102' Nómina, '96' RADIAN).
+                        // Populated server-side as `data-type` on the
+                        // <tr> — far more reliable than parsing the
+                        // visible 'Tipo' column text, which may be
+                        // localized or truncated.
+                        const dataType = node.getAttribute('data-type') || '';
                         const cells = [...node.querySelectorAll('td')].map(
                             (c) => (c.innerText || c.textContent || '').trim()
                         );
@@ -1101,7 +1108,7 @@ class DianTestScraper:
                         // Skip empty-state placeholder rows
                         // ('No se encontraron resultados', etc.)
                         if (cells.length === 1 && !dataId) return;
-                        out.push({ dataId, cells });
+                        out.push({ dataId, dataType, cells });
                     });
                     return out;
                 };
@@ -1315,6 +1322,99 @@ class DianTestScraper:
             if invoice.cufe:
                 candidates.append(invoice)
 
+        # Pre-download filter: drop rows that NUVARA's import pipeline
+        # would always reject anyway. Three buckets, identified BEFORE
+        # we spend download budget on them:
+        #
+        #   - Payroll (type 102 'Nomina individual electrónica' and 103
+        #     'Nota de ajuste nómina'). NUVARA imports nómina through
+        #     a separate flow, not via /Document/Received.
+        #   - RADIAN event responses (type 96). Status messages, not
+        #     invoices.
+        #   - Total value parses to 0 (e.g. cancelled contingencies).
+        #     Causation has nothing to book for them.
+        #
+        # The decision uses the <tr>'s data-type attribute when
+        # present; we fall back to substring matching on the visible
+        # 'Tipo' column ONLY when the attribute is missing, so a
+        # DIAN markup regression can't silently start filtering
+        # everything by mismatching the numeric codes.
+        PAYROLL_TYPES = {"102", "103"}
+        RADIAN_TYPES = {"96"}
+        nomina_filtered = 0
+        radian_filtered = 0
+        zero_filtered = 0
+        kept: list[InvoiceRow] = []
+        for inv in candidates:
+            raw = inv.raw if isinstance(inv.raw, dict) else {}
+            data_type = str(raw.get("dataType") or "").strip()
+            cells = raw.get("cells") or []
+            tipo_text = cells[5].lower() if len(cells) > 5 else ""
+            total_text = cells[12] if len(cells) > 12 else ""
+            # Numeric type code from the row attribute is preferred.
+            # If empty, sniff the visible 'Tipo' column for 'nomina'
+            # or 'radian' as a defensive secondary check.
+            is_payroll = data_type in PAYROLL_TYPES or (
+                not data_type and "nomina" in tipo_text
+            )
+            is_radian = data_type in RADIAN_TYPES or (
+                not data_type and "radian" in tipo_text
+            )
+            # Normalize total value: strip currency sign, NBSPs and
+            # thousand/decimal separators. After the strip a 'zero'
+            # in any locale (e.g. '0', '0.00' → '000', '0,00' → '000')
+            # collapses to a non-empty string of nothing but '0' digits.
+            # The empty-string case means an empty cell — we don't
+            # treat that as zero because we can't tell whether DIAN
+            # served an actual value of 0 or just left the cell blank.
+            normalized_total = (
+                total_text
+                .replace("$", "")
+                .replace("\u00a0", "")  # non-breaking space
+                .replace(" ", "")
+                .replace(".", "")
+                .replace(",", "")
+                .strip()
+            )
+            is_zero_value = (
+                bool(total_text)
+                and normalized_total != ""
+                and all(c == "0" for c in normalized_total)
+            )
+            if is_payroll:
+                nomina_filtered += 1
+                continue
+            if is_radian:
+                radian_filtered += 1
+                continue
+            if is_zero_value:
+                zero_filtered += 1
+                continue
+            kept.append(inv)
+
+        total_pre_filtered = (
+            nomina_filtered + radian_filtered + zero_filtered
+        )
+        if total_pre_filtered > 0:
+            await self._emit(
+                DownloadEvent(
+                    timestamp=datetime.utcnow().isoformat(),
+                    sequence=0,
+                    cufe="",
+                    prefijo_folio="",
+                    phase="list",
+                    status="info",
+                    notes=(
+                        f"Omitted {total_pre_filtered} rows pre-download: "
+                        f"{nomina_filtered} nómina, "
+                        f"{radian_filtered} RADIAN, "
+                        f"{zero_filtered} valor cero "
+                        f"— {len(kept)} candidates remain."
+                    ),
+                )
+            )
+        candidates = kept
+
         # Skip CUFEs the consumer (NUVARA) already has. We log the
         # skipped count separately so an operator can see at a glance
         # that the engine isn't re-downloading already-imported
@@ -1362,7 +1462,8 @@ class DianTestScraper:
                     f"found {len(invoices)} invoices "
                     f"(recordsTotal={records_total}, method={method}, "
                     f"pages={pages}, max_cap={self.max_invoices}, "
-                    f"skipped={skipped_count})"
+                    f"skipped={skipped_count}, "
+                    f"pre_filtered={total_pre_filtered})"
                 ),
             )
         )
