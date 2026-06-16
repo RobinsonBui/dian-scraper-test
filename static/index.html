@@ -369,6 +369,86 @@
       padding: 30px 14px;
       font-size: 12px;
     }
+
+    /* API key gate — blocks all interaction until the operator
+       pastes the SCRAPER_API_KEY. The key lives in sessionStorage
+       so it dies with the tab; we deliberately don't persist it. */
+    .auth-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.72);
+      display: none;
+      align-items: center; justify-content: center;
+      z-index: 1000;
+    }
+    .auth-overlay.show { display: flex; }
+    .auth-modal {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      width: 420px;
+      max-width: 90vw;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+    }
+    .auth-modal h2 {
+      margin: 0 0 12px 0;
+      font-size: 15px; font-weight: 600;
+      color: var(--text);
+    }
+    .auth-modal p {
+      margin: 0 0 16px 0;
+      color: var(--text-dim);
+      font-size: 12px; line-height: 1.5;
+    }
+    .auth-modal p code {
+      font-family: var(--mono);
+      background: var(--bg-3);
+      padding: 1px 4px;
+      border-radius: 3px;
+      font-size: 11px;
+    }
+    .auth-modal input {
+      width: 100%; padding: 10px 12px;
+      background: var(--bg-3);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      outline: none;
+    }
+    .auth-modal input:focus { border-color: var(--accent); }
+    .auth-modal .auth-error {
+      color: var(--fail);
+      font-size: 11px;
+      margin-top: 8px;
+      display: none;
+    }
+    .auth-modal .auth-error.show { display: block; }
+    .auth-modal .btn-row {
+      margin-top: 16px;
+      display: flex; justify-content: flex-end;
+    }
+    .auth-key-status {
+      font-size: 11px;
+      color: var(--text-dim);
+      display: flex; align-items: center; gap: 8px;
+      margin-right: 12px;
+    }
+    .auth-key-status button {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      cursor: pointer;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-family: inherit;
+    }
+    .auth-key-status button:hover {
+      color: var(--text);
+      border-color: var(--text-dim);
+    }
   </style>
 </head>
 <body>
@@ -378,12 +458,18 @@
         <span class="dot"></span>
         DIAN Scraper Test
       </h1>
-      <div class="stats" id="stats">
-        <span class="stat">Total <strong id="stat-total">0</strong></span>
-        <span class="stat ok">OK <strong id="stat-ok">0</strong></span>
-        <span class="stat fail">Fail <strong id="stat-fail">0</strong></span>
-        <span class="stat block">Block <strong id="stat-block">0</strong></span>
-        <span class="stat">Avg <strong id="stat-avg">—</strong></span>
+      <div style="display: flex; align-items: center;">
+        <div class="auth-key-status" id="authKeyStatus" style="display: none;">
+          <span>🔑 autenticada</span>
+          <button id="btnForgetKey" type="button">olvidar</button>
+        </div>
+        <div class="stats" id="stats">
+          <span class="stat">Total <strong id="stat-total">0</strong></span>
+          <span class="stat ok">OK <strong id="stat-ok">0</strong></span>
+          <span class="stat fail">Fail <strong id="stat-fail">0</strong></span>
+          <span class="stat block">Block <strong id="stat-block">0</strong></span>
+          <span class="stat">Avg <strong id="stat-avg">—</strong></span>
+        </div>
       </div>
     </header>
 
@@ -492,8 +578,82 @@
     </section>
   </div>
 
+  <!-- API key gate. Shown when sessionStorage has no SCRAPER_API_KEY
+       or when a 401 response invalidates the cached one. -->
+  <div id="authOverlay" class="auth-overlay">
+    <div class="auth-modal">
+      <h2>API Key requerida</h2>
+      <p>
+        Pegá el valor de <code>SCRAPER_API_KEY</code> configurado en el
+        servidor. Se guarda en <code>sessionStorage</code> (se borra
+        cuando cerrás esta pestaña).
+      </p>
+      <input id="apiKeyInput" type="password" autocomplete="off"
+             placeholder="SCRAPER_API_KEY..." spellcheck="false" />
+      <div id="authError" class="auth-error"></div>
+      <div class="btn-row">
+        <button id="btnAuthSave" class="btn" type="button">
+          Guardar y continuar
+        </button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const $ = (id) => document.getElementById(id);
+
+    // ── API key gate ─────────────────────────────────────────────────
+    //
+    // SCRAPER_API_KEY in the server's env protects every /api/* and
+    // /files/* request once it's set. The UI itself runs on the
+    // public '/' route, so we have to inject the key on every call
+    // from the browser. We keep it in sessionStorage so it survives
+    // a tab refresh but disappears when the tab closes — the right
+    // tradeoff for a shared secret that operators paste from a
+    // password manager.
+    const API_KEY_STORAGE = 'dian_scraper_api_key';
+
+    const getApiKey = () => sessionStorage.getItem(API_KEY_STORAGE) || '';
+    const setApiKey = (v) => sessionStorage.setItem(API_KEY_STORAGE, v);
+    const clearApiKey = () => sessionStorage.removeItem(API_KEY_STORAGE);
+
+    function showAuthModal(errorMessage) {
+      const overlay = $('authOverlay');
+      const errorEl = $('authError');
+      if (errorMessage) {
+        errorEl.textContent = errorMessage;
+        errorEl.classList.add('show');
+      } else {
+        errorEl.classList.remove('show');
+      }
+      overlay.classList.add('show');
+      setTimeout(() => $('apiKeyInput').focus(), 50);
+    }
+    function hideAuthModal() {
+      $('authOverlay').classList.remove('show');
+      $('apiKeyInput').value = '';
+      $('authError').classList.remove('show');
+    }
+    function updateAuthStatus() {
+      $('authKeyStatus').style.display = getApiKey() ? 'flex' : 'none';
+    }
+
+    // Wrapper around fetch() that injects X-API-Key and converts
+    // 401 into a re-prompt. Callers never need to think about the
+    // key once they switch to authedFetch.
+    async function authedFetch(url, options = {}) {
+      const key = getApiKey();
+      const headers = Object.assign({}, options.headers || {});
+      if (key) headers['X-API-Key'] = key;
+      const resp = await fetch(url, Object.assign({}, options, { headers }));
+      if (resp.status === 401) {
+        clearApiKey();
+        updateAuthStatus();
+        showAuthModal('API key inválida o expirada. Pegala de nuevo.');
+        throw new Error('unauthorized');
+      }
+      return resp;
+    }
 
     // Default dates: previous month
     (() => {
@@ -740,7 +900,7 @@
         if (!ok) return;
       }
       try {
-        const resp = await fetch('/api/start', {
+        const resp = await authedFetch('/api/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -757,7 +917,11 @@
         state.currentJobId = body.job_id || null;
         setRunning(true);
       } catch (e) {
-        alert('Error: ' + e.message);
+        // authedFetch raises 'unauthorized' after re-showing the modal.
+        // We swallow it here so the alert() below doesn't double up.
+        if (e.message !== 'unauthorized') {
+          alert('Error: ' + e.message);
+        }
       }
     });
 
@@ -766,11 +930,17 @@
         alert('Iniciá un run primero — no hay nada para cancelar.');
         return;
       }
-      await fetch('/api/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_id: state.currentJobId }),
-      });
+      try {
+        await authedFetch('/api/cancel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_id: state.currentJobId }),
+        });
+      } catch (e) {
+        if (e.message !== 'unauthorized') {
+          alert('Error: ' + e.message);
+        }
+      }
     });
 
     $('btnClear').addEventListener('click', () => {
@@ -786,19 +956,48 @@
       updateStats();
     });
 
-    // WebSocket
+    // WebSocket — Browsers can't set custom headers on the WS
+    // handshake, so the server accepts the API key as ?api_key=<v>
+    // for browser clients (same constant-time check as the HTTP
+    // path). On reconnect we re-read getApiKey() so a key rotation
+    // (operator pasted a new one) lands without a page refresh.
+    let activeWs = null;
     function connectWs() {
+      const key = getApiKey();
+      if (!key) {
+        // Nothing to do until the operator provides the key. The
+        // modal is already up; once they save we reconnect from the
+        // save handler.
+        return;
+      }
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${location.host}/ws`);
-      ws.addEventListener('message', (e) => {
+      const url = `${proto}//${location.host}/ws?api_key=${encodeURIComponent(key)}`;
+      activeWs = new WebSocket(url);
+      activeWs.addEventListener('message', (e) => {
         try {
           const msg = JSON.parse(e.data);
           handleMessage(msg);
         } catch {}
       });
-      ws.addEventListener('close', () => {
+      activeWs.addEventListener('close', (e) => {
+        // 1008 (policy violation) = server rejected the key. Don't
+        // hammer-loop reconnect, surface the modal instead.
+        if (e.code === 1008) {
+          clearApiKey();
+          updateAuthStatus();
+          showAuthModal('La WebSocket fue rechazada — API key inválida.');
+          return;
+        }
         setTimeout(connectWs, 1500);
       });
+    }
+
+    function reconnectWs() {
+      if (activeWs) {
+        try { activeWs.close(); } catch {}
+        activeWs = null;
+      }
+      connectWs();
     }
 
     function handleMessage(msg) {
@@ -828,7 +1027,46 @@
       }
     }
 
-    connectWs();
+    // ── Auth modal wiring + bootstrap ────────────────────────────────
+    //
+    // If we already have a key (sessionStorage) we connect the WS
+    // straight away. Otherwise the modal stays up and connectWs
+    // runs from the Save handler once the operator pastes the value.
+
+    $('btnAuthSave').addEventListener('click', () => {
+      const v = $('apiKeyInput').value.trim();
+      if (!v) {
+        $('authError').textContent = 'Pegá la API key antes de continuar.';
+        $('authError').classList.add('show');
+        return;
+      }
+      setApiKey(v);
+      hideAuthModal();
+      updateAuthStatus();
+      reconnectWs();
+    });
+    $('apiKeyInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        $('btnAuthSave').click();
+      }
+    });
+    $('btnForgetKey').addEventListener('click', () => {
+      clearApiKey();
+      updateAuthStatus();
+      if (activeWs) {
+        try { activeWs.close(); } catch {}
+        activeWs = null;
+      }
+      showAuthModal();
+    });
+
+    updateAuthStatus();
+    if (!getApiKey()) {
+      showAuthModal();
+    } else {
+      connectWs();
+    }
   </script>
 </body>
 </html>
