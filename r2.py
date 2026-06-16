@@ -226,16 +226,31 @@ class R2Storage:
 
         Tries HEAD on the bucket. Returns False (and logs) if anything
         fails — callers can decide whether to block startup on this.
+
+        Why we catch BotoCoreError (parent) and not just ClientError:
+        an unreachable / misspelled endpoint URL raises
+        EndpointConnectionError, which is a sibling of ClientError
+        under BotoCoreError, not a subclass. Without the wider catch
+        a single typo in R2_ENDPOINT crashes the container at boot,
+        defeating the point of returning a bool for the caller to
+        decide on.
+
+        We deliberately do NOT catch generic Exception — that would
+        also swallow programmer errors (AttributeError, TypeError)
+        which we want to surface loudly.
         """
         # Import here too so an in-memory backend that never hits R2
         # never pays the cost of loading botocore.
-        from botocore.exceptions import ClientError  # noqa: PLC0415
+        from botocore.exceptions import (  # noqa: PLC0415
+            BotoCoreError,
+            ClientError,
+        )
         try:
             await asyncio.to_thread(
                 self._client.head_bucket, Bucket=self._bucket
             )
             return True
-        except ClientError as e:
+        except (BotoCoreError, ClientError) as e:
             logger.warning("R2 health check failed: %s", e)
             return False
 

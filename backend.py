@@ -184,7 +184,21 @@ class PostgresR2JobBackend:
         # Validate R2 connectivity at boot; log a warning rather than
         # crash so a misconfigured bucket doesn't break the API as
         # a whole — uploads will fail loudly on first attempt anyway.
-        ok = await storage.health_check()
+        #
+        # We wrap in try/except as defense in depth: R2Storage.health_check
+        # is supposed to swallow boto errors and return False, but botocore
+        # has surprised us before (e.g. EndpointConnectionError sneaking
+        # past a narrow except). A crash here would defeat the whole point
+        # of returning a bool — the API never gets to tell the operator
+        # what's misconfigured because the container exits before binding
+        # to the port.
+        try:
+            ok = await storage.health_check()
+        except Exception:
+            logger.exception(
+                "R2 health check raised; treating as not-ok and continuing.",
+            )
+            ok = False
         if not ok:
             logger.warning(
                 "R2 health check failed at startup — uploads will likely fail.",
