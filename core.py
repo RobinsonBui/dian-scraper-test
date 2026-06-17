@@ -1647,32 +1647,56 @@ class DianTestScraper:
         candidates = kept
 
         # docType narrow-down. Today only the `support` family is
-        # modelled (DS / DE). We keep only rows whose visible "Tipo"
-        # column (cells[5]) matches one of the family substrings.
-        # NUVARA uses this on `support` runs to pull DS / DE out of
-        # the Sent bucket without downloading regular sales — the
-        # alternative (download everything, drop sales by docType
-        # downstream) is wasteful and risks tripping anti-bot rate
-        # limits on tenants with many real sales per month.
+        # modelled (DS / DE). We keep only rows whose document type
+        # matches the family. Three-layer detection so a DIAN markup
+        # tweak can't silently drop everything:
+        #
+        #   1. data-type attribute on the <tr> with a known DS / DE
+        #      numeric code (preferred — most stable across UI
+        #      revisions).
+        #   2. The visible "Tipo" column (cells[5]) containing the
+        #      short code "DS" or "DE" as a whole word.
+        #   3. ANY cell containing the long Spanish phrase
+        #      "documento soporte" / "documento equivalente".
+        #
+        # Any of the three matching keeps the row. NUVARA uses this
+        # on `support` runs to pull DS / DE out of the Sent bucket
+        # without downloading regular sales.
         if self.doc_type_filter == "support":
+            SUPPORT_DATA_TYPES = {"05", "11", "5", "12"}
             support_kept: list[InvoiceRow] = []
             doc_type_filtered = 0
             for inv in candidates:
                 raw = inv.raw if isinstance(inv.raw, dict) else {}
                 cells = raw.get("cells") or []
-                tipo_text = (cells[5] if len(cells) > 5 else "").lower()
-                # Accept either Spanish phrase exactly as DIAN
-                # renders it. Future variants (e.g. accentless,
-                # camel-cased) can be added here without churning
-                # the scraper's general filter path.
+                data_type = str(raw.get("dataType") or "").strip()
+                tipo_text = (cells[5] if len(cells) > 5 else "").lower().strip()
+                # Layer 1: numeric code on the <tr>.
+                if data_type in SUPPORT_DATA_TYPES:
+                    support_kept.append(inv)
+                    continue
+                # Layer 2: short code in the "Tipo" column. We match
+                # the whole word so we don't false-positive on e.g.
+                # 'DSF' or 'DEUDA'.
+                if tipo_text in ("ds", "de"):
+                    support_kept.append(inv)
+                    continue
+                # Layer 3: long phrase in ANY cell. This catches the
+                # case where DIAN dropped a "Documento soporte con no
+                # obligados" description into a column other than
+                # Tipo (e.g. between Tipo and NIT Emisor). Match is
+                # accent-insensitive lowercase substring.
+                all_cells_text = " ".join(
+                    str(c or "").lower() for c in cells
+                )
                 if (
-                    "documento soporte" in tipo_text
-                    or "documento equivalente" in tipo_text
+                    "documento soporte" in all_cells_text
+                    or "documento equivalente" in all_cells_text
                 ):
                     support_kept.append(inv)
-                else:
-                    doc_type_filtered += 1
-            if doc_type_filtered > 0:
+                    continue
+                doc_type_filtered += 1
+            if doc_type_filtered > 0 or len(support_kept) > 0:
                 await self._emit(
                     DownloadEvent(
                         timestamp=datetime.utcnow().isoformat(),
