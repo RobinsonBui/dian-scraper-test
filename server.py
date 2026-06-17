@@ -409,11 +409,15 @@ class StartRequest(BaseModel):
     # Default 'purchase' keeps old NUVARA images that don't send the
     # field working as before. The standalone UI of this scraper
     # always uses the default — it's M2M / NUVARA that flips it.
-    #
-    # The 'support' / Documento Soporte case from NUVARA's main sync
-    # is intentionally NOT modeled here; that needs a dual-bucket
-    # query plan we don't implement on this rail yet.
     direction: Literal["purchase", "sale"] = "purchase"
+    # Optional docType filter applied to the listing AFTER pagination
+    # but BEFORE the download queue. The only family modelled today is
+    # "support", which keeps rows whose visible "Tipo" column contains
+    # either "documento soporte" (DS) or "documento equivalente" (DE).
+    # NUVARA uses it for the support rail (DS pulled from /Sent but
+    # causada como compra). Older NUVARA images simply omit the field
+    # and the scraper falls back to the legacy "all doctypes" path.
+    doc_type_filter: Optional[Literal["support"]] = None
 
 
 # --------------------------------------------------------------------------
@@ -967,6 +971,10 @@ async def _run_job(job_id: str, req: StartRequest) -> None:
                     # layout is identical on both, so the rest of the
                     # engine is direction-agnostic.
                     direction=req.direction,
+                    # Optional docType narrow-down. None == legacy
+                    # "all doctypes after the always-on pre-filter"
+                    # behaviour.
+                    doc_type_filter=req.doc_type_filter,
                     cancel_event=cancel_event,
                 ) as scraper:
                     scraper_ref = scraper

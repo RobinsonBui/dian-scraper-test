@@ -362,6 +362,7 @@ class DianTestScraper:
         cancel_event: asyncio.Event | None = None,
         skip_cufes: list[str] | set[str] | None = None,
         direction: str = "purchase",
+        doc_type_filter: str | None = None,
     ) -> None:
         # Two new params (both opt-in, defaults preserve legacy behaviour):
         #
@@ -396,8 +397,15 @@ class DianTestScraper:
         # We deliberately drop None/empty strings up front so a sloppy
         # caller can't silently fill the set with junk that never
         # matches anything.
+        #
+        # Casing: DIAN's listing always serves CUFEs lowercase, so we
+        # normalize the skip set to lowercase too. Without this, a
+        # consumer that canonicalizes CUFEs to UPPERCASE (NUVARA does,
+        # see normalize-cufe.ts) sends a skip list that the
+        # case-sensitive `in` check below would never match, and the
+        # engine quietly re-downloads every known invoice.
         self.skip_cufes: set[str] = (
-            {c for c in skip_cufes if c}
+            {c.lower() for c in skip_cufes if c}
             if skip_cufes
             else set()
         )
@@ -412,6 +420,17 @@ class DianTestScraper:
             )
         self.direction: str = direction
         self.list_url: str = SENT_URL if direction == "sale" else RECEIVED_URL
+
+        # Optional docType narrow-down applied after pagination but
+        # before the download queue. Today only 'support' is modelled
+        # (DS + DE substring match on the visible Tipo column).
+        # Unknown values raise so a NUVARA bug never silently falls
+        # back to "no filter" and pulls every sale row.
+        if doc_type_filter is not None and doc_type_filter not in ("support",):
+            raise ValueError(
+                f"doc_type_filter must be None or 'support', got {doc_type_filter!r}"
+            )
+        self.doc_type_filter: str | None = doc_type_filter
 
         self.pw: Playwright | None = None
         self.browser: Browser | None = None
@@ -1627,6 +1646,51 @@ class DianTestScraper:
             )
         candidates = kept
 
+        # docType narrow-down. Today only the `support` family is
+        # modelled (DS / DE). We keep only rows whose visible "Tipo"
+        # column (cells[5]) matches one of the family substrings.
+        # NUVARA uses this on `support` runs to pull DS / DE out of
+        # the Sent bucket without downloading regular sales — the
+        # alternative (download everything, drop sales by docType
+        # downstream) is wasteful and risks tripping anti-bot rate
+        # limits on tenants with many real sales per month.
+        if self.doc_type_filter == "support":
+            support_kept: list[InvoiceRow] = []
+            doc_type_filtered = 0
+            for inv in candidates:
+                raw = inv.raw if isinstance(inv.raw, dict) else {}
+                cells = raw.get("cells") or []
+                tipo_text = (cells[5] if len(cells) > 5 else "").lower()
+                # Accept either Spanish phrase exactly as DIAN
+                # renders it. Future variants (e.g. accentless,
+                # camel-cased) can be added here without churning
+                # the scraper's general filter path.
+                if (
+                    "documento soporte" in tipo_text
+                    or "documento equivalente" in tipo_text
+                ):
+                    support_kept.append(inv)
+                else:
+                    doc_type_filtered += 1
+            if doc_type_filtered > 0:
+                await self._emit(
+                    DownloadEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        sequence=0,
+                        cufe="",
+                        prefijo_folio="",
+                        phase="list",
+                        status="info",
+                        notes=(
+                            f"docType filter (support): kept "
+                            f"{len(support_kept)} DS / DE, dropped "
+                            f"{doc_type_filtered} other rows from the "
+                            f"Sent bucket."
+                        ),
+                    )
+                )
+            candidates = support_kept
+
         # Skip CUFEs the consumer (NUVARA) already has. We log the
         # skipped count separately so an operator can see at a glance
         # that the engine isn't re-downloading already-imported
@@ -1637,7 +1701,10 @@ class DianTestScraper:
         if self.skip_cufes:
             filtered: list[InvoiceRow] = []
             for inv in candidates:
-                if inv.cufe in self.skip_cufes:
+                # Defensive lowercasing in case DIAN ever ships mixed
+                # case in the data-id attribute. The skip set is
+                # already lowercase (see __init__).
+                if (inv.cufe or "").lower() in self.skip_cufes:
                     skipped_count += 1
                     continue
                 filtered.append(inv)
