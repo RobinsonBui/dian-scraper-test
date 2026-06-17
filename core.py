@@ -1039,6 +1039,81 @@ class DianTestScraper:
                 )
             )
 
+        # docType narrow-down at the SERVER-SIDE level: DIAN's
+        # /Document/Sent has a <select id="DocumentTypeId"> that, when
+        # set to "05" (Documento soporte con no obligados), tells
+        # /Document/GetDocumentsPageToken to return ONLY DS rows.
+        # That's far more reliable than scraping the full Sent
+        # listing (which may span dozens of pages of regular sales)
+        # and filtering in Python afterwards.
+        #
+        # We drive the select via both raw value AND the
+        # bootstrap-select widget (which DIAN uses to render the
+        # pretty dropdown) so the visible button label stays in sync
+        # with the value the AJAX call reads on submit.
+        if self.doc_type_filter == "support":
+            dian_doc_type_code = "05"  # Documento soporte con no obligados
+            try:
+                doctype_applied = await self.page.evaluate(
+                    """({code}) => {
+                        const jq = window.jQuery || window.$;
+                        let valueOk = false;
+                        let widgetOk = false;
+                        try {
+                            const sel = document.querySelector(
+                                '#DocumentTypeId'
+                            );
+                            if (sel) {
+                                sel.value = code;
+                                sel.dispatchEvent(
+                                    new Event('change', { bubbles: true })
+                                );
+                                valueOk = sel.value === code;
+                            }
+                        } catch (e) { /* keep valueOk=false */ }
+                        try {
+                            if (jq) {
+                                jq('#DocumentTypeId')
+                                    .selectpicker('val', code)
+                                    .selectpicker('refresh');
+                                widgetOk = true;
+                            }
+                        } catch (e) { /* keep widgetOk=false */ }
+                        return { valueOk, widgetOk };
+                    }""",
+                    {"code": dian_doc_type_code},
+                )
+                await self._emit(
+                    DownloadEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        sequence=0,
+                        cufe="",
+                        prefijo_folio="",
+                        phase="log",
+                        status="info",
+                        notes=(
+                            f"docType select set: code={dian_doc_type_code} "
+                            f"(value={doctype_applied.get('valueOk')}, "
+                            f"widget={doctype_applied.get('widgetOk')})"
+                        ),
+                    )
+                )
+            except Exception as e:
+                await self._emit(
+                    DownloadEvent(
+                        timestamp=datetime.utcnow().isoformat(),
+                        sequence=0,
+                        cufe="",
+                        prefijo_folio="",
+                        phase="log",
+                        status="info",
+                        notes=(
+                            f"⚠ DocumentTypeId not set ({e}). Falling "
+                            f"back to Python-side substring filter."
+                        ),
+                    )
+                )
+
         # Submit. CRITICAL: DIAN's portal requires a real click on the
         # "Buscar" button — a naive form.submit() bypasses the jQuery
         # handler that writes the date range hidden inputs and fires
